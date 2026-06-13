@@ -139,12 +139,26 @@ def can_alert(symbol,table="alerts",cooldown=ALERT_COOLDOWN):
 
 
 # ═══════════ تلگرام ═══════════
-def tg_send(cid,text):
-    try:requests.post(f"{TG}/sendMessage",json={"chat_id":cid,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},timeout=15)
+def tg_send(cid,text,buttons=None):
+    payload={"chat_id":cid,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
+    if buttons:
+        payload["reply_markup"]={"inline_keyboard":buttons}
+    try:requests.post(f"{TG}/sendMessage",json=payload,timeout=15)
     except Exception as e:print(f"[!] send {cid}: {e}")
 def broadcast(text):
     for cid in active_members():
         tg_send(cid,text);time.sleep(0.4)
+
+# ── منوی دکمه‌ای اصلی ──
+def main_menu(is_admin=False):
+    kb=[
+        [{"text":"📊 آمار","callback_data":"stats"},{"text":"📅 رویداد اقتصادی","callback_data":"econ"}],
+        [{"text":"🔄 چرخه BTC","callback_data":"cycle_BTC"},{"text":"💧 نقدینگی BTC","callback_data":"liq_BTC"}],
+        [{"text":"❓ راهنما","callback_data":"help"},{"text":"🔕 لغو عضویت","callback_data":"stop"}],
+    ]
+    if is_admin:
+        kb.append([{"text":"👥 اعضا","callback_data":"members"},{"text":"🔧 آمار ادمین","callback_data":"admin"}])
+    return kb
 
 
 # ═══════════ داده و سشن ═══════════
@@ -162,6 +176,7 @@ def current_session():
 def us_subsession():
     """زیربخش سشن US برای هشدار تایم‌ها (UTC)"""
     t=datetime.now(timezone.utc);m=t.hour*60+t.minute
+    if 12*60<=m<13*60+30:return "premarket"   # پیش‌بازار (Pre-Market)
     if 13*60+30<=m<14*60+30:return "open"
     if 16*60<=m<16*60+30:return "lunch"
     if 19*60<=m<20*60:return "power"
@@ -387,13 +402,13 @@ def handle_command(cid,un,text):
     text=(text or "").strip();is_admin=str(cid)==str(ADMIN_CHAT)
     if text.startswith("/start"):
         add_member(cid,un)
-        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n\n{DISCLAIMER}\n\n/help راهنما")
+        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n\n{DISCLAIMER}\n\n👇 از دکمه‌های زیر استفاده کن:",
+                buttons=main_menu(is_admin))
     elif text.startswith("/stop"):
         remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
-    elif text.startswith("/help"):
-        h="📋 <b>دستورات:</b>\n/start عضویت\n/stop لغو\n/stats آمار\n/cycle SYMBOL وضعیت چرخه (مثل /cycle ETH)\n/liq SYMBOL وضعیت نقدینگی\n/econ رویداد اقتصادی بعدی\n/help راهنما"
-        if is_admin:h+="\n\n🔧 ادمین:\n/members\n/broadcast متن\n/admin"
-        tg_send(cid,h)
+    elif text.startswith("/help") or text.startswith("/menu"):
+        h="📋 <b>منوی ربات</b>\n\nاز دکمه‌های زیر استفاده کن، یا دستورها را تایپ کن:\n/cycle ETH — وضعیت چرخه یک ارز\n/liq ETH — نقدینگی یک ارز"
+        tg_send(cid,h,buttons=main_menu(is_admin))
     elif text.startswith("/stats"):
         tg_send(cid,f"👥 اعضا: {member_count()}\n🕐 سشن: {current_session()}")
     elif text.startswith("/econ"):
@@ -429,6 +444,25 @@ def handle_command(cid,un,text):
         if msg:broadcast(f"📢 {msg}");tg_send(cid,f"✅ به {member_count()} نفر ارسال شد.")
         else:tg_send(cid,"استفاده: /broadcast متن")
 
+def answer_callback(callback_id):
+    """به تلگرام بگو کلیک دریافت شد (تا لودینگ دکمه قطع شود)"""
+    try:requests.post(f"{TG}/answerCallbackQuery",json={"callback_query_id":callback_id},timeout=10)
+    except Exception:pass
+
+def handle_callback(cid,un,data,callback_id):
+    """مدیریت کلیک روی دکمه‌ها"""
+    answer_callback(callback_id)
+    is_admin=str(cid)==str(ADMIN_CHAT)
+    # دکمه‌ها را به دستورهای متنی نگاشت کن
+    if data=="stats":handle_command(cid,un,"/stats")
+    elif data=="econ":handle_command(cid,un,"/econ")
+    elif data=="help":handle_command(cid,un,"/help")
+    elif data=="stop":handle_command(cid,un,"/stop")
+    elif data=="members" and is_admin:handle_command(cid,un,"/members")
+    elif data=="admin" and is_admin:handle_command(cid,un,"/admin")
+    elif data=="cycle_BTC":handle_command(cid,un,"/cycle BTC")
+    elif data=="liq_BTC":handle_command(cid,un,"/liq BTC")
+
 def poll_updates():
     offset=None
     while True:
@@ -437,9 +471,17 @@ def poll_updates():
             if offset:params["offset"]=offset
             r=requests.get(f"{TG}/getUpdates",params=params,timeout=35);data=r.json()
             for upd in data.get("result",[]):
-                offset=upd["update_id"]+1;msg=upd.get("message")
-                if not msg:continue
-                handle_command(msg["chat"]["id"],msg["chat"].get("username",""),msg.get("text",""))
+                offset=upd["update_id"]+1
+                # پیام متنی
+                msg=upd.get("message")
+                if msg:
+                    handle_command(msg["chat"]["id"],msg["chat"].get("username",""),msg.get("text",""))
+                    continue
+                # کلیک دکمه
+                cb=upd.get("callback_query")
+                if cb:
+                    handle_callback(cb["from"]["id"],cb["from"].get("username",""),
+                                    cb.get("data",""),cb["id"])
         except Exception as e:
             print(f"[!] poll: {e}");time.sleep(5)
 
@@ -453,12 +495,13 @@ def session_alert_loop():
             last_sub=get_state("last_us_sub","")
             if sub and sub!=last_sub:
                 set_state("last_us_sub",sub)
-                msgs={"open":"🔔 <b>US Open</b> شروع شد (Killzone) — بهترین زمان setup. مراقب باش.",
+                msgs={"premarket":"⏰ <b>Pre-Market US</b> — یک ساعت تا باز شدن بازار آمریکا. آماده شو و چرخه‌ها را چک کن.",
+                      "open":"🔔 <b>US Open</b> شروع شد (Killzone) — بهترین زمان setup. مراقب باش.",
                       "lunch":"🍽 <b>US Lunch</b> — معمولاً کم‌نوسان، احتیاط در ورود.",
                       "power":"⚡ <b>Power Hour</b> شروع شد (Killzone) — حرکت‌های قوی پایان روز محتمل."}
                 broadcast(msgs[sub])
-                # خبر و اقتصاد همراه US Open
-                if sub=="open":
+                # خبر و اقتصاد همراه Pre-Market و US Open
+                if sub in ("premarket","open"):
                     ea=econ_alert_text()
                     if ea:broadcast(ea)
                     news=fetch_btc_news()
