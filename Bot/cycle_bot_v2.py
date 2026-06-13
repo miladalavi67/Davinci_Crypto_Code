@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ربات چرخه سه‌سشنه + رفتارشناسی + نقدینگی + خبر (نسخه ۲)
+═══════════════════════════════════════════════════════════
+قابلیت‌ها:
+  🌏🇬🇧🇺🇸 چرخه سه‌سشنه: آسیا (شکست 1H) → لندن (پولبک 15M) → US (حرکت 15M+5M)
+  ⏰ هشدار تایم‌های US: Open / Lunch / Power Hour (به همه اعضا)
+  📅 تقویم اقتصادی + خبر زنده بیت‌کوین (FOMC/CPI/NFP + اخبار)
+  💧 رصد نقدینگی مستقل: ورود/خروج مکرر پول (از دیتابیس)
+  🧮 تحلیل سناریو با numpy/pandas: احتمال بر اساس رفتار گذشته
+  👥 مدیریت اعضا
+
+پیش‌نیاز:  pip install requests numpy pandas
+Env Vars:  TELEGRAM_TOKEN, ADMIN_CHAT, SCAN_INTERVAL (پیش‌فرض 300)
+           NEWS_API (اختیاری: کلید cryptopanic برای خبر زنده)
+"""
+
+import os, time, sqlite3, threading
+from datetime import datetime, timezone, timedelta
+
+try:
+    import requests
+except ImportError:
+    raise SystemExit("نصب کن:  pip install requests numpy pandas")
+
+# numpy/pandas اختیاری — اگر نبود، تحلیل ساده‌تر می‌شود
+try:
+    import numpy as np
+    import pandas as pd
+    HAS_NP = True
+except ImportError:
+    HAS_NP = False
+    print("[!] numpy/pandas نصب نیست — تحلیل آماری ساده می‌شود. برای کامل: pip install numpy pandas")
+
+TOKEN      = os.environ.get("TELEGRAM_TOKEN", "")
+ADMIN_CHAT = os.environ.get("ADMIN_CHAT", "")
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "300"))
+NEWS_API   = os.environ.get("NEWS_API", "")   # کلید cryptopanic (اختیاری)
+BASE = "https://fapi.binance.com"
+TG   = f"https://api.telegram.org/bot{TOKEN}"
+DB_FILE = "cycle_bot.db"
+ALERT_COOLDOWN = 45 * 60
+LIQ_COOLDOWN   = 60 * 60
+
+DISCLAIMER = ("⚠️ <b>سلب مسئولیت:</b> ابزار آموزشی/اطلاعاتی، نه سیگنال مالی. "
+              "تحلیل‌ها آماری و بر اساس رفتار گذشته‌اند. مسئولیت معاملات با خودت است.")
+
+# ── تقویم اقتصادی ۲۰۲۶ (UTC) ──
+ECON_EVENTS = [
+    ("2026-06-11", "CPI (تورم می)"),
+    ("2026-06-17", "FOMC + نرخ بهره"),
+    ("2026-07-03", "NFP (اشتغال)"),
+    ("2026-07-15", "CPI (تورم ژوئن)"),
+    ("2026-07-29", "FOMC + نرخ بهره"),
+    ("2026-08-07", "NFP (اشتغال)"),
+    ("2026-08-12", "CPI (تورم ژوئیه)"),
+    ("2026-09-04", "NFP (اشتغال)"),
+    ("2026-09-11", "CPI (تورم اوت)"),
+    ("2026-09-16", "FOMC + نرخ بهره"),
+]
+
+
+# ═══════════ دیتابیس ═══════════
+def db():
+    conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = db(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS members(
+        chat_id TEXT PRIMARY KEY, username TEXT, joined TEXT, active INTEGER DEFAULT 1)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS cycle(
+        symbol TEXT, day TEXT, asia_break TEXT, asia_method TEXT, asia_level REAL, asia_ts REAL,
+        london_pullback INTEGER DEFAULT 0, london_quality TEXT, london_ts REAL,
+        us_move INTEGER DEFAULT 0, us_ts REAL, PRIMARY KEY(symbol, day))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS history(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, day TEXT,
+        completed INTEGER, direction TEXT, ts REAL)""")
+    # جدول جدید: جریان نقدینگی هر ارز در هر اسکن
+    c.execute("""CREATE TABLE IF NOT EXISTS liquidity(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, ts REAL,
+        flow TEXT, cvd REAL, rvol REAL, chg REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS liq_alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)""")
+    conn.commit(); conn.close()
+
+def today_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def get_state(k, default=None):
+    conn=db();c=conn.cursor();c.execute("SELECT v FROM state WHERE k=?",(k,));r=c.fetchone();conn.close()
+    return r["v"] if r else default
+def set_state(k,v):
+    conn=db();c=conn.cursor();c.execute("INSERT OR REPLACE INTO state(k,v) VALUES(?,?)",(k,str(v)));conn.commit();conn.close()
+
+# اعضا
+def add_member(cid,un):
+    conn=db();c=conn.cursor();c.execute("INSERT OR REPLACE INTO members(chat_id,username,joined,active) VALUES(?,?,?,1)",(str(cid),un or "",datetime.now().isoformat()));conn.commit();conn.close()
+def remove_member(cid):
+    conn=db();c=conn.cursor();c.execute("UPDATE members SET active=0 WHERE chat_id=?",(str(cid),));conn.commit();conn.close()
+def active_members():
+    conn=db();c=conn.cursor();c.execute("SELECT chat_id FROM members WHERE active=1");r=[x["chat_id"] for x in c.fetchall()];conn.close();return r
+def member_count():
+    conn=db();c=conn.cursor();c.execute("SELECT COUNT(*) n FROM members WHERE active=1");n=c.fetchone()["n"];conn.close();return n
+
+# چرخه
+def get_cycle(symbol):
+    conn=db();c=conn.cursor();c.execute("SELECT * FROM cycle WHERE symbol=? AND day=?",(symbol,today_str()));r=c.fetchone();conn.close();return r
+def upsert_asia(symbol,d,method,level):
+    conn=db();c=conn.cursor()
+    c.execute("""INSERT INTO cycle(symbol,day,asia_break,asia_method,asia_level,asia_ts) VALUES(?,?,?,?,?,?)
+        ON CONFLICT(symbol,day) DO UPDATE SET asia_break=?,asia_method=?,asia_level=?,asia_ts=?""",
+        (symbol,today_str(),d,method,level,time.time(),d,method,level,time.time()))
+    conn.commit();conn.close()
+def upsert_london(symbol,q):
+    conn=db();c=conn.cursor();c.execute("UPDATE cycle SET london_pullback=1,london_quality=?,london_ts=? WHERE symbol=? AND day=?",(q,time.time(),symbol,today_str()));conn.commit();conn.close()
+def upsert_us(symbol):
+    conn=db();c=conn.cursor();c.execute("UPDATE cycle SET us_move=1,us_ts=? WHERE symbol=? AND day=?",(time.time(),symbol,today_str()));conn.commit();conn.close()
+
+# نقدینگی
+def record_liquidity(symbol,flow,cvd,rvol,chg):
+    conn=db();c=conn.cursor()
+    c.execute("INSERT INTO liquidity(symbol,ts,flow,cvd,rvol,chg) VALUES(?,?,?,?,?,?)",(symbol,time.time(),flow,cvd,rvol,chg))
+    c.execute("DELETE FROM liquidity WHERE ts < ?",(time.time()-7*86400,))
+    conn.commit();conn.close()
+
+def liquidity_history(symbol, hours=12):
+    conn=db();c=conn.cursor()
+    c.execute("SELECT * FROM liquidity WHERE symbol=? AND ts>? ORDER BY ts",(symbol,time.time()-hours*3600))
+    rows=[dict(r) for r in c.fetchall()];conn.close();return rows
+
+def can_alert(symbol,table="alerts",cooldown=ALERT_COOLDOWN):
+    conn=db();c=conn.cursor();c.execute(f"SELECT last_ts FROM {table} WHERE symbol=?",(symbol,))
+    row=c.fetchone();now=time.time()
+    if row and now-row["last_ts"]<cooldown:conn.close();return False
+    c.execute(f"INSERT OR REPLACE INTO {table}(symbol,last_ts) VALUES(?,?)",(symbol,now));conn.commit();conn.close();return True
+
+
+# ═══════════ تلگرام ═══════════
+def tg_send(cid,text):
+    try:requests.post(f"{TG}/sendMessage",json={"chat_id":cid,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},timeout=15)
+    except Exception as e:print(f"[!] send {cid}: {e}")
+def broadcast(text):
+    for cid in active_members():
+        tg_send(cid,text);time.sleep(0.4)
+
+
+# ═══════════ داده و سشن ═══════════
+def http_get(url,timeout=15):
+    try:r=requests.get(url,timeout=timeout,headers={"User-Agent":"bot"});return r.json() if r.ok else None
+    except Exception:return None
+
+def current_session():
+    t=datetime.now(timezone.utc);m=t.hour*60+t.minute
+    if m>=23*60 or m<7*60:return "asia"
+    if 7*60<=m<13*60+30:return "london"
+    if 13*60+30<=m<20*60:return "us"
+    return "off"
+
+def us_subsession():
+    """زیربخش سشن US برای هشدار تایم‌ها (UTC)"""
+    t=datetime.now(timezone.utc);m=t.hour*60+t.minute
+    if 13*60+30<=m<14*60+30:return "open"
+    if 16*60<=m<16*60+30:return "lunch"
+    if 19*60<=m<20*60:return "power"
+    return None
+
+def load_symbols():
+    info=http_get(f"{BASE}/fapi/v1/exchangeInfo")
+    if not info or "symbols" not in info:return []
+    return [s["symbol"] for s in info["symbols"] if s.get("contractType")=="PERPETUAL" and s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
+
+
+# ═══════════ تقویم اقتصادی + خبر ═══════════
+def next_econ_event():
+    today=datetime.now(timezone.utc).date()
+    best=None;best_days=9999
+    for ds,name in ECON_EVENTS:
+        d=datetime.strptime(ds,"%Y-%m-%d").date()
+        days=(d-today).days
+        if 0<=days<best_days:best_days=days;best={"name":name,"days":days,"date":ds}
+    return best
+
+def econ_alert_text():
+    e=next_econ_event()
+    if not e:return None
+    if e["days"]==0:return f"🔴 <b>امروز:</b> {e['name']} — تا بعد از انتشار (≈۲۱:۳۰ تهران برای FOMC) ترید نکن!"
+    if e["days"]==1:return f"🟠 <b>فردا:</b> {e['name']} — نوسان شدید محتمل"
+    return None
+
+def fetch_btc_news():
+    """خبر زنده بیت‌کوین از CryptoPanic (اگر کلید موجود باشد)"""
+    if not NEWS_API:return None
+    try:
+        url=f"https://cryptopanic.com/api/v1/posts/?auth_token={NEWS_API}&currencies=BTC&filter=important&public=true"
+        d=http_get(url)
+        if not d or "results" not in d:return None
+        items=d["results"][:3]
+        if not items:return None
+        out=["📰 <b>اخبار مهم بیت‌کوین:</b>"]
+        for it in items:
+            title=it.get("title","")
+            out.append(f"• {title}")
+        return "\n".join(out)
+    except Exception:
+        return None
+
+
+# ═══════════ ابزار تحلیل ═══════════
+def klines(symbol,interval,limit=50):
+    return http_get(f"{BASE}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
+def to_candles(kl):
+    return [{"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"vol":float(k[5]),"tb":float(k[9])} for k in kl]
+
+def lin_reg(pts):
+    n=len(pts)
+    if n<3:return None
+    sx=sum(range(n));sy=sum(pts);sxy=sum(i*pts[i] for i in range(n));sxx=sum(i*i for i in range(n))
+    den=(n*sxx-sx*sx)
+    if den==0:return None
+    slope=(n*sxy-sx*sy)/den;intercept=(sy-slope*sx)/n
+    my=sy/n;ss_tot=sum((p-my)**2 for p in pts);ss_res=sum((pts[i]-(slope*i+intercept))**2 for i in range(n))
+    r2=1-ss_res/ss_tot if ss_tot>0 else 0
+    return {"slope":slope,"intercept":intercept,"r2":r2,"pred":lambda i:slope*i+intercept}
+
+def detect_asia_break(kl1h):
+    if not kl1h or len(kl1h)<20:return None
+    C=to_candles(kl1h);price=C[-1]["c"];recent=C[-12:]
+    struct_high=max(c["h"] for c in recent[:-2]);struct_low=min(c["l"] for c in recent[:-2])
+    bos=None
+    if C[-1]["c"]>struct_high*1.001:bos="bull"
+    elif C[-1]["c"]<struct_low*0.999:bos="bear"
+    highs=[c["h"] for c in recent];lows=[c["l"] for c in recent]
+    regH=lin_reg(highs);regL=lin_reg(lows);trend=None
+    if regH and regL:
+        n=len(recent);upper=regH["pred"](n-1);lower=regL["pred"](n-1)
+        if price>upper*1.002 and regH["r2"]>0.4:trend="bull"
+        elif price<lower*0.998 and regL["r2"]>0.4:trend="bear"
+    direction=None;method=None;level=None
+    if bos and trend and bos==trend:direction=bos;method="both";level=struct_high if bos=="bull" else struct_low
+    elif bos:direction=bos;method="BOS";level=struct_high if bos=="bull" else struct_low
+    elif trend:direction=trend;method="trendline";level=price
+    if not direction:return None
+    return {"direction":direction,"method":method,"level":level,"price":price}
+
+def detect_london_pullback(kl15,asia_dir,asia_level):
+    if not kl15 or len(kl15)<20 or not asia_level:return None
+    C=to_candles(kl15);price=C[-1]["c"];recent=C[-12:]
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-8:])
+    if asia_dir=="bull":
+        low_after=min(c["l"] for c in recent);near=abs(low_after-asia_level)/asia_level<0.012
+        if near or (price<max(c["h"] for c in recent) and price>asia_level):
+            return {"quality":"healthy" if (rvol<1.5 or cvd>0) else "weak","rvol":round(rvol,2),"cvd":round(cvd,1)}
+    elif asia_dir=="bear":
+        high_after=max(c["h"] for c in recent);near=abs(high_after-asia_level)/asia_level<0.012
+        if near or (price>min(c["l"] for c in recent) and price<asia_level):
+            return {"quality":"healthy" if (rvol<1.5 or cvd<0) else "weak","rvol":round(rvol,2),"cvd":round(cvd,1)}
+    return None
+
+def detect_us_move(kl15,kl5,asia_dir):
+    if not kl15 or len(kl15)<20:return None
+    C=to_candles(kl15);price=C[-1]["c"]
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-8:])
+    recent=C[-6:];move=(recent[-1]["c"]-recent[0]["o"])/recent[0]["o"]*100
+    c5_ok=False
+    if kl5 and len(kl5)>=10:
+        C5=to_candles(kl5);d5=[c["tb"]-(c["vol"]-c["tb"]) for c in C5];cvd5=sum(d5[-6:])
+        c5_ok=(cvd5>0) if asia_dir=="bull" else (cvd5<0)
+    aligned=False;strength=0
+    if asia_dir=="bull" and move>0.8 and cvd>0:aligned=True;strength=move
+    elif asia_dir=="bear" and move<-0.8 and cvd<0:aligned=True;strength=abs(move)
+    if not aligned:return None
+    return {"rvol":round(rvol,2),"cvd":round(cvd,1),"move":round(move,2),"c5_confirm":c5_ok,"strength":round(strength,2),"price":price}
+
+# ── تحلیل نقدینگی (مستقل از چرخه) ──
+def analyze_liquidity(kl15):
+    if not kl15 or len(kl15)<25:return None
+    C=to_candles(kl15);price=C[-1]["c"]
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-8:])
+    chg=(C[-1]["c"]-C[-6]["c"])/C[-6]["c"]*100
+    flow="none"
+    if rvol>=1.5 and cvd>0:flow="in"
+    elif rvol>=1.5 and cvd<0:flow="out"
+    return {"flow":flow,"cvd":round(cvd,1),"rvol":round(rvol,2),"chg":round(chg,2),"price":price}
+
+# ── تحلیل سناریو با numpy/pandas ──
+def scenario_analysis(symbol):
+    """بر اساس تاریخچه نقدینگی، احتمال سناریو را تخمین می‌زند"""
+    hist=liquidity_history(symbol,hours=12)
+    if len(hist)<4:return None
+    in_count=sum(1 for h in hist if h["flow"]=="in")
+    out_count=sum(1 for h in hist if h["flow"]=="out")
+    total=in_count+out_count
+    if total<3:return None
+
+    result={"in":in_count,"out":out_count,"total":total}
+
+    if HAS_NP:
+        df=pd.DataFrame(hist)
+        # روند CVD تجمعی
+        df["cvd_cum"]=df["cvd"].cumsum()
+        cvd_trend=np.polyfit(range(len(df)),df["cvd_cum"],1)[0] if len(df)>2 else 0
+        # همبستگی نقدینگی با تغییر قیمت
+        if len(df)>3 and df["chg"].std()>0 and df["cvd"].std()>0:
+            corr=np.corrcoef(df["cvd"],df["chg"])[0,1]
+        else:
+            corr=0
+        result["cvd_trend"]=round(float(cvd_trend),1)
+        result["corr"]=round(float(corr),2)
+        # میانگین حرکت بعد از ورود پول
+        result["avg_chg"]=round(float(df["chg"].mean()),2)
+    else:
+        result["cvd_trend"]=0;result["corr"]=0
+        result["avg_chg"]=round(sum(h["chg"] for h in hist)/len(hist),2)
+
+    # تعیین سناریو محتمل
+    in_ratio=in_count/total
+    if in_ratio>=0.65 and result.get("avg_chg",0)>0:
+        result["scenario"]="accumulation"   # تجمع → احتمال رشد
+        result["prob"]=round(in_ratio*100)
+    elif out_count/total>=0.65 and result.get("avg_chg",0)<0:
+        result["scenario"]="distribution"    # توزیع → احتمال ریزش
+        result["prob"]=round(out_count/total*100)
+    elif in_ratio>0.55:
+        result["scenario"]="mild_accum"
+        result["prob"]=round(in_ratio*100)
+    elif out_count/total>0.55:
+        result["scenario"]="mild_dist"
+        result["prob"]=round(out_count/total*100)
+    else:
+        result["scenario"]="mixed";result["prob"]=50
+    return result
+
+
+# ═══════════ پیام‌ها ═══════════
+def build_stage3_message(symbol,cyc,us):
+    coin=symbol.replace("USDT","");d=cyc["asia_break"];dfa="صعودی 📈" if d=="bull" else "نزولی 📉"
+    L=[f"🚀 <b>{coin}</b> — حرکت اصلی سشن آمریکا!"]
+    L.append(f"💵 ${us['price']} · جهت چرخه: {dfa}");L.append("")
+    L.append("🔄 <b>چرخه سه‌سشنه کامل شد:</b>")
+    m={"BOS":"شکست ساختار","trendline":"شکست خط روند","both":"شکست ساختار+خط روند"}.get(cyc["asia_method"],cyc["asia_method"])
+    L.append(f"   🌏 آسیا: {m} ({dfa})")
+    lq=cyc["london_quality"];lqf="سالم ✅" if lq=="healthy" else "ضعیف ⚠️" if lq=="weak" else "—"
+    L.append(f"   🇬🇧 لندن: پولبک {lqf}")
+    L.append(f"   🇺🇸 آمریکا: حرکت {'+' if us['move']>0 else ''}{us['move']}% · RVOL {us['rvol']} · CVD {'+' if us['cvd']>0 else ''}{us['cvd']:.0f}")
+    if us["c5_confirm"]:L.append("   ✅ تأیید 5M: جریان هم‌جهت")
+    # سناریو
+    sc=scenario_analysis(symbol)
+    if sc:L.append("");L.append(scenario_text(sc))
+    L.append("")
+    if cyc["london_quality"]=="healthy" and us["c5_confirm"]:
+        L.append("🥇 <b>چرخه باکیفیت</b> — کاندیدای قوی حرکت اصلی!")
+    else:L.append("⚖️ چرخه شکل گرفت، کیفیت کامل نیست — احتیاط.")
+    L.append(f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+    return "\n".join(L)
+
+def scenario_text(sc):
+    names={"accumulation":"تجمع قوی (ورود مکرر پول) → احتمال رشد","distribution":"توزیع قوی (خروج مکرر پول) → احتمال ریزش",
+           "mild_accum":"تجمع ملایم","mild_dist":"توزیع ملایم","mixed":"مختلط/بی‌جهت"}
+    icon={"accumulation":"🟢","distribution":"🔴","mild_accum":"🟡","mild_dist":"🟠","mixed":"⚪"}
+    t=f"🧮 <b>سناریو محتمل:</b> {icon.get(sc['scenario'],'')} {names.get(sc['scenario'],'')} (~{sc['prob']}%)"
+    t+=f"\n   ورود {sc['in']} بار / خروج {sc['out']} بار در ۱۲س اخیر"
+    if HAS_NP and "corr" in sc:
+        t+=f"\n   همبستگی نقدینگی-قیمت: {sc['corr']}"
+    return t
+
+def build_liquidity_message(symbol,liq,sc):
+    coin=symbol.replace("USDT","")
+    fl="📥 ورود مکرر پول" if liq["flow"]=="in" else "📤 خروج مکرر پول"
+    L=[f"💧 <b>{coin}</b> — {fl}"]
+    L.append(f"💵 ${liq['price']} · تغییر {'+' if liq['chg']>0 else ''}{liq['chg']}% · RVOL {liq['rvol']}")
+    if sc:L.append("");L.append(scenario_text(sc))
+    L.append(f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+    return "\n".join(L)
+
+
+# ═══════════ دستورات ═══════════
+def handle_command(cid,un,text):
+    text=(text or "").strip();is_admin=str(cid)==str(ADMIN_CHAT)
+    if text.startswith("/start"):
+        add_member(cid,un)
+        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n\n{DISCLAIMER}\n\n/help راهنما")
+    elif text.startswith("/stop"):
+        remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
+    elif text.startswith("/help"):
+        h="📋 <b>دستورات:</b>\n/start عضویت\n/stop لغو\n/stats آمار\n/cycle SYMBOL وضعیت چرخه (مثل /cycle ETH)\n/liq SYMBOL وضعیت نقدینگی\n/econ رویداد اقتصادی بعدی\n/help راهنما"
+        if is_admin:h+="\n\n🔧 ادمین:\n/members\n/broadcast متن\n/admin"
+        tg_send(cid,h)
+    elif text.startswith("/stats"):
+        tg_send(cid,f"👥 اعضا: {member_count()}\n🕐 سشن: {current_session()}")
+    elif text.startswith("/econ"):
+        e=next_econ_event()
+        if e:tg_send(cid,f"📅 رویداد بعدی: <b>{e['name']}</b>\nتاریخ: {e['date']} ({e['days']} روز دیگر)")
+        else:tg_send(cid,"رویدادی ثبت نشده.")
+    elif text.startswith("/cycle"):
+        parts=text.split()
+        if len(parts)>=2:
+            sym=parts[1].upper();sym=sym if sym.endswith("USDT") else sym+"USDT"
+            cyc=get_cycle(sym)
+            if cyc and cyc["asia_break"]:
+                d="صعودی" if cyc["asia_break"]=="bull" else "نزولی"
+                tg_send(cid,f"🔄 چرخه {sym.replace('USDT','')}:\n🌏 آسیا: ✅ {d}\n🇬🇧 لندن: {'✅ پولبک '+(cyc['london_quality'] or '') if cyc['london_pullback'] else '⏳ هنوز نه'}\n🇺🇸 آمریکا: {'✅ حرکت' if cyc['us_move'] else '⏳ هنوز نه'}")
+            else:tg_send(cid,f"چرخه‌ای برای {sym.replace('USDT','')} امروز ثبت نشده.")
+        else:tg_send(cid,"استفاده: /cycle ETH")
+    elif text.startswith("/liq"):
+        parts=text.split()
+        if len(parts)>=2:
+            sym=parts[1].upper();sym=sym if sym.endswith("USDT") else sym+"USDT"
+            sc=scenario_analysis(sym)
+            if sc:tg_send(cid,f"💧 نقدینگی {sym.replace('USDT','')}:\n{scenario_text(sc)}")
+            else:tg_send(cid,f"داده کافی برای {sym.replace('USDT','')} نیست (هنوز رصد نشده).")
+        else:tg_send(cid,"استفاده: /liq ETH")
+    elif text.startswith("/members") and is_admin:
+        tg_send(cid,f"👥 اعضا: {member_count()}")
+    elif text.startswith("/admin") and is_admin:
+        conn=db();c=conn.cursor();c.execute("SELECT COUNT(*) n FROM cycle WHERE day=?",(today_str(),));cn=c.fetchone()["n"]
+        c.execute("SELECT COUNT(*) n FROM liquidity");ln=c.fetchone()["n"];conn.close()
+        tg_send(cid,f"🔧 آمار:\n👥 اعضا: {member_count()}\n🔄 چرخه امروز: {cn}\n💧 رکورد نقدینگی: {ln}\n🕐 سشن: {current_session()}\n🧮 numpy: {'✅' if HAS_NP else '❌'}")
+    elif text.startswith("/broadcast") and is_admin:
+        msg=text[len("/broadcast"):].strip()
+        if msg:broadcast(f"📢 {msg}");tg_send(cid,f"✅ به {member_count()} نفر ارسال شد.")
+        else:tg_send(cid,"استفاده: /broadcast متن")
+
+def poll_updates():
+    offset=None
+    while True:
+        try:
+            params={"timeout":30}
+            if offset:params["offset"]=offset
+            r=requests.get(f"{TG}/getUpdates",params=params,timeout=35);data=r.json()
+            for upd in data.get("result",[]):
+                offset=upd["update_id"]+1;msg=upd.get("message")
+                if not msg:continue
+                handle_command(msg["chat"]["id"],msg["chat"].get("username",""),msg.get("text",""))
+        except Exception as e:
+            print(f"[!] poll: {e}");time.sleep(5)
+
+
+# ═══════════ هشدارهای زمان‌بندی‌شده (تایم US + اقتصاد) ═══════════
+def session_alert_loop():
+    """هشدار تایم‌های US و رویدادهای اقتصادی"""
+    while True:
+        try:
+            sub=us_subsession()
+            last_sub=get_state("last_us_sub","")
+            if sub and sub!=last_sub:
+                set_state("last_us_sub",sub)
+                msgs={"open":"🔔 <b>US Open</b> شروع شد (Killzone) — بهترین زمان setup. مراقب باش.",
+                      "lunch":"🍽 <b>US Lunch</b> — معمولاً کم‌نوسان، احتیاط در ورود.",
+                      "power":"⚡ <b>Power Hour</b> شروع شد (Killzone) — حرکت‌های قوی پایان روز محتمل."}
+                broadcast(msgs[sub])
+                # خبر و اقتصاد همراه US Open
+                if sub=="open":
+                    ea=econ_alert_text()
+                    if ea:broadcast(ea)
+                    news=fetch_btc_news()
+                    if news:broadcast(news)
+            elif not sub and last_sub:
+                set_state("last_us_sub","")
+
+            # هشدار روزانه رویداد اقتصادی (یک‌بار در روز، صبح UTC)
+            today=today_str()
+            if get_state("econ_daily_day","")!=today and datetime.now(timezone.utc).hour==6:
+                set_state("econ_daily_day",today)
+                ea=econ_alert_text()
+                if ea:broadcast(ea)
+        except Exception as e:
+            print(f"[!] session_alert: {e}")
+        time.sleep(60)
+
+
+# ═══════════ حلقه اسکن اصلی ═══════════
+def scan_loop():
+    symbols=load_symbols();print(f"[+] {len(symbols)} نماد.")
+    sym_reload=time.time()
+    while True:
+        try:
+            if time.time()-sym_reload>6*3600:
+                symbols=load_symbols();sym_reload=time.time()
+            sess=current_session();t0=time.time();cycle_alerts=[];liq_alerts=[]
+            for i,sym in enumerate(symbols):
+                try:
+                    # رصد نقدینگی (همیشه، همه سشن‌ها)
+                    kl15=klines(sym,"15m",30)
+                    liq=analyze_liquidity(kl15)
+                    if liq and liq["flow"]!="none":
+                        record_liquidity(sym,liq["flow"],liq["cvd"],liq["rvol"],liq["chg"])
+                        # سناریو: اگر ورود/خروج مکرر بود، هشدار مستقل
+                        sc=scenario_analysis(sym)
+                        if sc and sc["scenario"] in ("accumulation","distribution") and sc["prob"]>=70:
+                            if can_alert(sym,"liq_alerts",LIQ_COOLDOWN):
+                                liq_alerts.append((sym,liq,sc))
+
+                    # چرخه سه‌سشنه
+                    if sess=="asia":
+                        kl1h=klines(sym,"1h",30);br=detect_asia_break(kl1h)
+                        if br:upsert_asia(sym,br["direction"],br["method"],br["level"])
+                    elif sess=="london":
+                        cyc=get_cycle(sym)
+                        if cyc and cyc["asia_break"] and not cyc["london_pullback"]:
+                            pb=detect_london_pullback(kl15,cyc["asia_break"],cyc["asia_level"])
+                            if pb:upsert_london(sym,pb["quality"])
+                    elif sess=="us":
+                        cyc=get_cycle(sym)
+                        if cyc and cyc["asia_break"] and cyc["london_pullback"] and not cyc["us_move"]:
+                            kl5=klines(sym,"5m",20);mv=detect_us_move(kl15,kl5,cyc["asia_break"])
+                            if mv and can_alert(sym):
+                                upsert_us(sym)
+                                conn=db();c=conn.cursor()
+                                c.execute("INSERT INTO history(symbol,day,completed,direction,ts) VALUES(?,?,1,?,?)",(sym,today_str(),cyc["asia_break"],time.time()))
+                                conn.commit();conn.close()
+                                cycle_alerts.append((sym,cyc,mv))
+                except Exception:
+                    pass
+                if i%8==0:time.sleep(0.4)
+            # ارسال هشدارها
+            cycle_alerts.sort(key=lambda x:(x[1]["london_quality"]!="healthy",-x[2]["strength"]))
+            for sym,cyc,mv in cycle_alerts:
+                broadcast(build_stage3_message(sym,cyc,mv));time.sleep(0.5)
+            liq_alerts.sort(key=lambda x:-x[2]["prob"])
+            for sym,liq,sc in liq_alerts[:10]:  # حداکثر ۱۰ تا که spam نشه
+                broadcast(build_liquidity_message(sym,liq,sc));time.sleep(0.5)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه={len(cycle_alerts)} نقدینگی={len(liq_alerts)}")
+        except Exception as e:
+            print(f"[!] scan: {e}")
+        time.sleep(SCAN_INTERVAL)
+
+
+def main():
+    print("="*50);print("ربات چرخه + نقدینگی + خبر (نسخه ۲)");print("="*50)
+    if not TOKEN or not ADMIN_CHAT:print("[!] TOKEN/ADMIN_CHAT تنظیم نشده!")
+    print(f"[*] numpy/pandas: {'فعال' if HAS_NP else 'غیرفعال'}")
+    print(f"[*] خبر زنده: {'فعال' if NEWS_API else 'غیرفعال (NEWS_API نذاشتی)'}")
+    init_db()
+    if ADMIN_CHAT:tg_send(ADMIN_CHAT,"✅ ربات نسخه ۲ روشن شد (چرخه + نقدینگی + خبر + تایم US).")
+    threading.Thread(target=poll_updates,daemon=True).start()
+    threading.Thread(target=session_alert_loop,daemon=True).start()
+    scan_loop()
+
+if __name__=="__main__":
+    main()
