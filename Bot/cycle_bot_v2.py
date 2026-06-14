@@ -42,6 +42,7 @@ TG   = f"https://api.telegram.org/bot{TOKEN}"
 DB_FILE = "cycle_bot.db"
 ALERT_COOLDOWN = 45 * 60
 LIQ_COOLDOWN   = 60 * 60
+BR_COOLDOWN    = 60 * 60
 
 DISCLAIMER = ("⚠️ <b>سلب مسئولیت:</b> ابزار آموزشی/اطلاعاتی، نه سیگنال مالی. "
               "تحلیل‌ها آماری و بر اساس رفتار گذشته‌اند. مسئولیت معاملات با خودت است.")
@@ -83,6 +84,7 @@ def init_db():
         flow TEXT, cvd REAL, rvol REAL, chg REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS liq_alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS br_alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)""")
     conn.commit(); conn.close()
 
@@ -139,17 +141,31 @@ def can_alert(symbol,table="alerts",cooldown=ALERT_COOLDOWN):
 
 
 # ═══════════ تلگرام ═══════════
-def tg_send(cid,text,buttons=None):
+def tg_send(cid,text,buttons=None,keyboard=None):
     payload={"chat_id":cid,"text":text,"parse_mode":"HTML","disable_web_page_preview":True}
     if buttons:
         payload["reply_markup"]={"inline_keyboard":buttons}
+    elif keyboard:
+        payload["reply_markup"]=keyboard
     try:requests.post(f"{TG}/sendMessage",json=payload,timeout=15)
     except Exception as e:print(f"[!] send {cid}: {e}")
 def broadcast(text):
     for cid in active_members():
         tg_send(cid,text);time.sleep(0.4)
 
-# ── منوی دکمه‌ای اصلی ──
+# ── پنل دکمه دائمی (Reply Keyboard) که همیشه پایین چت می‌ماند ──
+def panel_keyboard(is_admin=False):
+    rows=[
+        ["📊 آمار","📅 رویداد اقتصادی"],
+        ["🔄 چرخه BTC","💧 نقدینگی BTC"],
+        ["❓ راهنما","🔕 لغو عضویت"],
+    ]
+    if is_admin:
+        rows.append(["👥 اعضا","🔧 آمار ادمین"])
+    return {"keyboard":[[{"text":t} for t in row] for row in rows],
+            "resize_keyboard":True,"persistent":True}
+
+# ── منوی دکمه‌ای اصلی (inline، زیر پیام) ──
 def main_menu(is_admin=False):
     kb=[
         [{"text":"📊 آمار","callback_data":"stats"},{"text":"📅 رویداد اقتصادی","callback_data":"econ"}],
@@ -306,6 +322,62 @@ def analyze_liquidity(kl15):
     elif rvol>=1.5 and cvd<0:flow="out"
     return {"flow":flow,"cvd":round(cvd,1),"rvol":round(rvol,2),"chg":round(chg,2),"price":price}
 
+# ── تشخیص شکست محدوده / ریجکت روی ۱ ساعته با تأیید نقدینگی ──
+def detect_breakout_rejection(kl1h):
+    """
+    شکست محدوده (Breakout): قیمت از سقف/کف رنج اخیر زد بیرون + پول هم‌جهت
+    ریجکت (Rejection): به سطح خورد، سایه بلند زد و برگشت + پول مخالف
+    فقط وقتی پول تغذیه شده باشد (RVOL + CVD) برمی‌گرداند.
+    """
+    if not kl1h or len(kl1h)<30:return None
+    C=to_candles(kl1h);price=C[-1]["c"];last=C[-1]
+    # محدوده اخیر (۲۰ کندل قبل، به‌جز ۲ تای آخر)
+    rng=C[-22:-2]
+    hi=max(c["h"] for c in rng);lo=min(c["l"] for c in rng)
+    # نقدینگی
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-5:])
+    # مشخصات کندل آخر
+    body=abs(last["c"]-last["o"]);rng_c=last["h"]-last["l"]
+    up_wick=last["h"]-max(last["c"],last["o"])
+    dn_wick=min(last["c"],last["o"])-last["l"]
+
+    # ── شکست صعودی: close بالای سقف رنج + حجم + CVD مثبت ──
+    if last["c"]>hi and rvol>=1.6 and cvd>0 and (body/rng_c>0.5 if rng_c>0 else False):
+        return {"type":"breakout_up","level":round(hi,4),"price":price,
+                "rvol":round(rvol,2),"cvd":round(cvd,1),
+                "desc":"شکست صعودی محدوده + ورود پول"}
+    # ── شکست نزولی: close زیر کف رنج + حجم + CVD منفی ──
+    if last["c"]<lo and rvol>=1.6 and cvd<0 and (body/rng_c>0.5 if rng_c>0 else False):
+        return {"type":"breakout_down","level":round(lo,4),"price":price,
+                "rvol":round(rvol,2),"cvd":round(cvd,1),
+                "desc":"شکست نزولی محدوده + خروج پول"}
+    # ── ریجکت از سقف: به سقف خورد، سایه بالا بلند، برگشت + CVD منفی ──
+    if last["h"]>=hi*0.999 and up_wick>body*1.5 and up_wick>rng_c*0.4 and rvol>=1.5 and cvd<0:
+        return {"type":"reject_top","level":round(hi,4),"price":price,
+                "rvol":round(rvol,2),"cvd":round(cvd,1),
+                "desc":"ریجکت از سقف محدوده + خروج پول"}
+    # ── ریجکت از کف: به کف خورد، سایه پایین بلند، برگشت + CVD مثبت ──
+    if last["l"]<=lo*1.001 and dn_wick>body*1.5 and dn_wick>rng_c*0.4 and rvol>=1.5 and cvd>0:
+        return {"type":"reject_bottom","level":round(lo,4),"price":price,
+                "rvol":round(rvol,2),"cvd":round(cvd,1),
+                "desc":"ریجکت از کف محدوده + ورود پول"}
+    return None
+
+def build_breakout_message(symbol,br):
+    coin=symbol.replace("USDT","")
+    icons={"breakout_up":"🔼","breakout_down":"🔽","reject_top":"⛔","reject_bottom":"✅"}
+    titles={"breakout_up":"شکست صعودی","breakout_down":"شکست نزولی",
+            "reject_top":"ریجکت از سقف","reject_bottom":"ریجکت از کف"}
+    ic=icons.get(br["type"],"•")
+    L=[f"{ic} <b>{coin}</b> — {titles.get(br['type'],'')} (۱ ساعته)"]
+    L.append(f"💵 ${br['price']} · سطح: ${br['level']}")
+    L.append(f"📊 {br['desc']}")
+    L.append(f"   RVOL {br['rvol']} · CVD {'+' if br['cvd']>0 else ''}{br['cvd']:.0f}")
+    L.append(f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+    return "\n".join(L)
+
 # ── تحلیل سناریو با numpy/pandas ──
 def scenario_analysis(symbol):
     """بر اساس تاریخچه نقدینگی، احتمال سناریو را تخمین می‌زند"""
@@ -398,12 +470,23 @@ def build_liquidity_message(symbol,liq,sc):
 
 
 # ═══════════ دستورات ═══════════
+# نگاشت متن دکمه‌های پنل دائمی به دستورها
+PANEL_MAP={
+    "📊 آمار":"/stats","📅 رویداد اقتصادی":"/econ",
+    "🔄 چرخه BTC":"/cycle BTC","💧 نقدینگی BTC":"/liq BTC",
+    "❓ راهنما":"/help","🔕 لغو عضویت":"/stop",
+    "👥 اعضا":"/members","🔧 آمار ادمین":"/admin",
+}
+
 def handle_command(cid,un,text):
     text=(text or "").strip();is_admin=str(cid)==str(ADMIN_CHAT)
+    # اگر متن یکی از دکمه‌های پنل بود، به دستورش تبدیل کن
+    if text in PANEL_MAP:
+        text=PANEL_MAP[text]
     if text.startswith("/start"):
         add_member(cid,un)
-        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n\n{DISCLAIMER}\n\n👇 از دکمه‌های زیر استفاده کن:",
-                buttons=main_menu(is_admin))
+        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n🔼 شکست محدوده / 🔽 ریجکت (با تأیید پول)\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n🎯 ستاپ سایت تحلیل\n\n{DISCLAIMER}\n\n👇 از پنل دکمه‌های پایین استفاده کن:",
+                keyboard=panel_keyboard(is_admin))
     elif text.startswith("/stop"):
         remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
     elif text.startswith("/help") or text.startswith("/menu"):
@@ -528,7 +611,7 @@ def scan_loop():
         try:
             if time.time()-sym_reload>6*3600:
                 symbols=load_symbols();sym_reload=time.time()
-            sess=current_session();t0=time.time();cycle_alerts=[];liq_alerts=[]
+            sess=current_session();t0=time.time();cycle_alerts=[];liq_alerts=[];br_alerts=[]
             for i,sym in enumerate(symbols):
                 try:
                     # رصد نقدینگی (همیشه، همه سشن‌ها)
@@ -541,6 +624,12 @@ def scan_loop():
                         if sc and sc["scenario"] in ("accumulation","distribution") and sc["prob"]>=70:
                             if can_alert(sym,"liq_alerts",LIQ_COOLDOWN):
                                 liq_alerts.append((sym,liq,sc))
+
+                    # شکست محدوده / ریجکت روی ۱ ساعته (با تأیید پول) — هر ساعت یک‌بار
+                    kl1h_br=klines(sym,"1h",30)
+                    br=detect_breakout_rejection(kl1h_br)
+                    if br and can_alert(sym,"br_alerts",BR_COOLDOWN):
+                        br_alerts.append((sym,br))
 
                     # چرخه سه‌سشنه
                     if sess=="asia":
@@ -571,7 +660,10 @@ def scan_loop():
             liq_alerts.sort(key=lambda x:-x[2]["prob"])
             for sym,liq,sc in liq_alerts[:10]:  # حداکثر ۱۰ تا که spam نشه
                 broadcast(build_liquidity_message(sym,liq,sc));time.sleep(0.5)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه={len(cycle_alerts)} نقدینگی={len(liq_alerts)}")
+            # شکست/ریجکت (حداکثر ۸ تا در هر اسکن)
+            for sym,br in br_alerts[:8]:
+                broadcast(build_breakout_message(sym,br));time.sleep(0.5)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه={len(cycle_alerts)} نقدینگی={len(liq_alerts)} شکست={len(br_alerts)}")
         except Exception as e:
             print(f"[!] scan: {e}")
         time.sleep(SCAN_INTERVAL)
