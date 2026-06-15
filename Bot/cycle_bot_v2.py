@@ -167,7 +167,7 @@ def broadcast(text):
 def panel_keyboard(is_admin=False):
     rows=[
         ["📊 آمار","📅 رویداد اقتصادی"],
-        ["🔄 چرخه BTC","💧 نقدینگی BTC"],
+        ["📐 الگوی BTC","💧 نقدینگی BTC"],
         ["😱 احساسات بازار","❓ راهنما"],
         ["🔕 لغو عضویت"],
     ]
@@ -180,7 +180,7 @@ def panel_keyboard(is_admin=False):
 def main_menu(is_admin=False):
     kb=[
         [{"text":"📊 آمار","callback_data":"stats"},{"text":"📅 رویداد اقتصادی","callback_data":"econ"}],
-        [{"text":"🔄 چرخه BTC","callback_data":"cycle_BTC"},{"text":"💧 نقدینگی BTC","callback_data":"liq_BTC"}],
+        [{"text":"📐 الگوی BTC","callback_data":"pattern_BTC"},{"text":"💧 نقدینگی BTC","callback_data":"liq_BTC"}],
         [{"text":"❓ راهنما","callback_data":"help"},{"text":"🔕 لغو عضویت","callback_data":"stop"}],
     ]
     if is_admin:
@@ -418,6 +418,177 @@ def build_breakout_message(symbol,br):
     L.append(f"\n🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
     return "\n".join(L)
 
+
+# ── EMA ساده برای ربات ──
+def ema_series(values, period):
+    if len(values)<period:return None
+    k=2/(period+1);e=values[0]
+    out=[e]
+    for v in values[1:]:
+        e=v*k+e*(1-k);out.append(e)
+    return out
+
+
+# ── تشخیص الگوی مثلث / کنج روی ۱ ساعته + شکست با حجم ──
+def find_pivots(C, left=2, right=2):
+    """سقف‌ها و کف‌های محلی (pivot highs/lows)"""
+    highs=[];lows=[]
+    for i in range(left,len(C)-right):
+        h=C[i]["h"];l=C[i]["l"]
+        if all(h>=C[j]["h"] for j in range(i-left,i)) and all(h>=C[j]["h"] for j in range(i+1,i+right+1)):
+            highs.append((i,h))
+        if all(l<=C[j]["l"] for j in range(i-left,i)) and all(l<=C[j]["l"] for j in range(i+1,i+right+1)):
+            lows.append((i,l))
+    return highs,lows
+
+def detect_triangle_wedge(kl1h):
+    """
+    الگوی مثلث/کنج: خط روی سقف‌ها + خط روی کف‌ها.
+    اگر همگرا شدند → الگو هست. شکست با حجم → سیگنال.
+    """
+    if not kl1h or len(kl1h)<40:return None
+    C=to_candles(kl1h);price=C[-1]["c"]
+    seg=C[-40:]
+    highs,lows=find_pivots(seg,left=2,right=2)
+    if len(highs)<2 or len(lows)<2:return None
+
+    # خط روند روی سقف‌ها و کف‌ها (رگرسیون روی pivotها)
+    hx=[i for i,_ in highs];hy=[v for _,v in highs]
+    lx=[i for i,_ in lows];ly=[v for _,v in lows]
+    rh=lin_reg_xy(hx,hy);rl=lin_reg_xy(lx,ly)
+    if not rh or not rl:return None
+
+    n=len(seg)
+    upper_now=rh["slope"]*(n-1)+rh["intercept"]
+    lower_now=rl["slope"]*(n-1)+rl["intercept"]
+    upper_start=rh["intercept"];lower_start=rl["intercept"]
+    width_start=upper_start-lower_start
+    width_now=upper_now-lower_now
+    if width_start<=0 or width_now<=0:return None
+
+    # همگرایی: عرض الان کمتر از ۷۰٪ عرض اول
+    converging=width_now<width_start*0.7
+    if not converging:return None
+
+    sh=rh["slope"];sl=rl["slope"]
+    # تشخیص نوع الگو
+    avg=price
+    sh_n=sh/avg;sl_n=sl/avg  # شیب نرمال
+    if abs(sh_n)<0.0003 and sl_n>0.0003:
+        ptype="asc_triangle";pname="مثلث صعودی"
+    elif abs(sl_n)<0.0003 and sh_n<-0.0003:
+        ptype="desc_triangle";pname="مثلث نزولی"
+    elif sh_n<-0.0002 and sl_n>0.0002:
+        ptype="sym_triangle";pname="مثلث متقارن"
+    elif sh_n>0.0002 and sl_n>0.0002:
+        ptype="rising_wedge";pname="کنج صعودی"
+    elif sh_n<-0.0002 and sl_n<-0.0002:
+        ptype="falling_wedge";pname="کنج نزولی"
+    else:
+        ptype="triangle";pname="مثلث"
+
+    # نقدینگی برای تأیید
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-5:])
+
+    # شکست: قیمت از خط بالا یا پایین زده بیرون + حجم
+    broke=None
+    if price>upper_now and rvol>=1.6 and cvd>0:
+        broke="up"
+    elif price<lower_now and rvol>=1.6 and cvd<0:
+        broke="down"
+    if not broke:return None  # الگو هست ولی هنوز شکست معتبر نشده
+
+    return {"pattern":ptype,"pname":pname,"break_dir":broke,
+            "upper":round(upper_now,4),"lower":round(lower_now,4),
+            "price":price,"rvol":round(rvol,2),"cvd":round(cvd,1)}
+
+def lin_reg_xy(xs,ys):
+    """رگرسیون خطی روی نقاط دلخواه (x,y)"""
+    n=len(xs)
+    if n<2:return None
+    sx=sum(xs);sy=sum(ys);sxy=sum(xs[i]*ys[i] for i in range(n));sxx=sum(x*x for x in xs)
+    den=n*sxx-sx*sx
+    if den==0:return None
+    slope=(n*sxy-sx*sy)/den;intercept=(sy-slope*sx)/n
+    return {"slope":slope,"intercept":intercept}
+
+def build_pattern_message(symbol,pt):
+    coin=symbol.replace("USDT","")
+    ic="🔼" if pt["break_dir"]=="up" else "🔽"
+    dir_fa="صعودی" if pt["break_dir"]=="up" else "نزولی"
+    L=[f"{ic} <b>{coin}</b> — شکست از {pt['pname']}! (۱ ساعته)"]
+    L.append(f"💵 ${pt['price']}")
+    L.append(f"📐 الگو: {pt['pname']}")
+    L.append(f"{ic} جهت شکست: {dir_fa}")
+    L.append(f"📊 با حجم: ✅ تأیید (RVOL {pt['rvol']} · CVD {'+' if pt['cvd']>0 else ''}{pt['cvd']:.0f})")
+    L.append(f"\n⚠️ آماری، نه سیگنال. مدیریت ریسک کن.")
+    L.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+    return "\n".join(L)
+
+
+# ── پولبک به سطح مهم (فیبو + OB + EMA + هم‌پوشانی) برای امتیاز Pre-Market ──
+def detect_pullback_to_level(kl1h):
+    """
+    آیا قیمت به یه سطح مهم پولبک زده و واکنش نشون می‌ده؟
+    سطح مهم = فیبوناچی / Order Block / EMA — هرچه هم‌پوشانی بیشتر، قوی‌تر.
+    خروجی: امتیاز ۰ تا ۳ + جزئیات
+    """
+    if not kl1h or len(kl1h)<60:return None
+    C=to_candles(kl1h);price=C[-1]["c"]
+    closes=[c["c"] for c in C]
+
+    # EMA 50 و 200
+    e50=ema_series(closes,50);e200=ema_series(closes,200)
+    ema50=e50[-1] if e50 else None
+    ema200=e200[-1] if e200 else None
+
+    # swing برای فیبو
+    seg=C[-60:]
+    hi=max(c["h"] for c in seg);lo=min(c["l"] for c in seg)
+    hi_idx=max(range(len(seg)),key=lambda i:seg[i]["h"])
+    lo_idx=min(range(len(seg)),key=lambda i:seg[i]["l"])
+    swing_up=hi_idx>lo_idx
+    diff=hi-lo
+    fib_levels={}
+    for name,r in [("0.5",0.5),("0.618",0.618),("0.705",0.705)]:
+        fib_levels[name]=(hi-diff*r) if swing_up else (lo+diff*r)
+
+    # Order Block ساده (FVG اخیر)
+    obs=[]
+    for i in range(len(C)-3,max(0,len(C)-30),-1):
+        nxt=C[i+1]
+        if abs(nxt["c"]-nxt["o"])/nxt["o"]>0.006:
+            mid=(C[i]["l"]+C[i]["h"])/2
+            obs.append(mid)
+
+    # چک کن قیمت نزدیک کدوم سطوحه (±0.6%)
+    near=[]
+    def close_to(level):
+        return level and abs(price-level)/price<0.006
+    if close_to(ema50):near.append("EMA50")
+    if close_to(ema200):near.append("EMA200")
+    for fn,fl in fib_levels.items():
+        if close_to(fl):near.append(f"فیبو {fn}")
+    for ob in obs:
+        if close_to(ob):near.append("OB");break
+
+    if not near:return None
+
+    # امتیاز: هرچه هم‌پوشانی بیشتر
+    score=min(len(near),3)
+    # تأیید واکنش: کندل اخیر برگشتی باشه (سایه)
+    last=C[-1]
+    body=abs(last["c"]-last["o"]);rng=last["h"]-last["l"]
+    dn_wick=min(last["c"],last["o"])-last["l"]
+    up_wick=last["h"]-max(last["c"],last["o"])
+    reaction=(dn_wick>body or up_wick>body) if rng>0 else False
+
+    return {"score":score,"levels":near,"price":price,"reaction":reaction,
+            "overlap":len(near)>=2}
+
+
 # ── تحلیل سناریو با numpy/pandas ──
 def scenario_analysis(symbol):
     """بر اساس تاریخچه نقدینگی، احتمال سناریو را تخمین می‌زند"""
@@ -513,7 +684,7 @@ def build_liquidity_message(symbol,liq,sc):
 # نگاشت متن دکمه‌های پنل دائمی به دستورها
 PANEL_MAP={
     "📊 آمار":"/stats","📅 رویداد اقتصادی":"/econ",
-    "🔄 چرخه BTC":"/cycle BTC","💧 نقدینگی BTC":"/liq BTC",
+    "📐 الگوی BTC":"/pattern BTC","💧 نقدینگی BTC":"/liq BTC",
     "😱 احساسات بازار":"/sentiment",
     "❓ راهنما":"/help","🔕 لغو عضویت":"/stop",
     "👥 اعضا":"/members","🔧 آمار ادمین":"/admin",
@@ -531,7 +702,7 @@ def handle_command(cid,un,text):
     elif text.startswith("/stop"):
         remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
     elif text.startswith("/help") or text.startswith("/menu"):
-        h="📋 <b>منوی ربات</b>\n\nاز دکمه‌های زیر استفاده کن، یا دستورها را تایپ کن:\n/cycle ETH — وضعیت چرخه یک ارز\n/liq ETH — نقدینگی یک ارز"
+        h="📋 <b>منوی ربات</b>\n\nاز دکمه‌های زیر استفاده کن، یا دستورها را تایپ کن:\n/pattern ETH — الگوی مثلث/کنج یک ارز\n/liq ETH — نقدینگی یک ارز"
         tg_send(cid,h,buttons=main_menu(is_admin))
     elif text.startswith("/stats"):
         tg_send(cid,f"👥 اعضا: {member_count()}\n🕐 سشن: {current_session()}")
@@ -543,16 +714,19 @@ def handle_command(cid,un,text):
         fg=fear_greed_text()
         if fg:tg_send(cid,fg)
         else:tg_send(cid,"شاخص احساسات در دسترس نیست (بعداً امتحان کن).")
-    elif text.startswith("/cycle"):
+    elif text.startswith("/pattern"):
         parts=text.split()
         if len(parts)>=2:
             sym=parts[1].upper();sym=sym if sym.endswith("USDT") else sym+"USDT"
-            cyc=get_cycle(sym)
-            if cyc and cyc["asia_break"]:
-                d="صعودی" if cyc["asia_break"]=="bull" else "نزولی"
-                tg_send(cid,f"🔄 چرخه {sym.replace('USDT','')}:\n🌏 آسیا: ✅ {d}\n🇬🇧 لندن: {'✅ پولبک '+(cyc['london_quality'] or '') if cyc['london_pullback'] else '⏳ هنوز نه'}\n🇺🇸 آمریکا: {'✅ حرکت' if cyc['us_move'] else '⏳ هنوز نه'}")
-            else:tg_send(cid,f"چرخه‌ای برای {sym.replace('USDT','')} امروز ثبت نشده.")
-        else:tg_send(cid,"استفاده: /cycle ETH")
+            kl1h=klines(sym,"1h",60)
+            pt=detect_triangle_wedge(kl1h)
+            coin=sym.replace("USDT","")
+            if pt:
+                dir_fa="صعودی 🔼" if pt["break_dir"]=="up" else "نزولی 🔽"
+                tg_send(cid,f"📐 {coin}:\nالگو: {pt['pname']}\nشکست: {dir_fa}\nRVOL {pt['rvol']} · CVD {pt['cvd']:.0f}")
+            else:
+                tg_send(cid,f"📐 {coin}: الگوی مثلث/کنج فعال (با شکست) یافت نشد.\n(یا الگو هست ولی هنوز نشکسته، یا الگویی نیست)")
+        else:tg_send(cid,"استفاده: /pattern ETH")
     elif text.startswith("/liq"):
         parts=text.split()
         if len(parts)>=2:
@@ -588,7 +762,7 @@ def handle_callback(cid,un,data,callback_id):
     elif data=="stop":handle_command(cid,un,"/stop")
     elif data=="members" and is_admin:handle_command(cid,un,"/members")
     elif data=="admin" and is_admin:handle_command(cid,un,"/admin")
-    elif data=="cycle_BTC":handle_command(cid,un,"/cycle BTC")
+    elif data=="pattern_BTC":handle_command(cid,un,"/pattern BTC")
     elif data=="liq_BTC":handle_command(cid,un,"/liq BTC")
 
 def poll_updates():
@@ -626,22 +800,19 @@ def is_us_active(symbol):
 def score_candidate(symbol):
     """
     امتیاز ۰ تا ۱۰ برای ارزش ترید یک ارز در Pre-Market.
-    بر اساس داده‌ای که در آسیا/لندن جمع شده.
     """
     score=0;reasons=[];direction=None
-    cyc=get_cycle(symbol)
 
-    # ── چرخه کامل (آسیا شکست + لندن پولبک سالم) → ۳ ──
-    if cyc and cyc["asia_break"]:
-        if cyc["london_pullback"] and cyc["london_quality"]=="healthy":
-            score+=3;reasons.append("چرخه کامل (آسیا+لندن سالم)")
-            direction=cyc["asia_break"]
-        elif cyc["london_pullback"]:
-            score+=2;reasons.append("چرخه (پولبک معمولی)")
-            direction=cyc["asia_break"]
+    # ── پولبک به سطح مهم (فیبو/OB/EMA/هم‌پوشانی) → ۳ ──
+    kl1h=klines(symbol,"1h",200)
+    pb=detect_pullback_to_level(kl1h)
+    if pb:
+        if pb["overlap"] and pb["reaction"]:
+            score+=3;reasons.append("پولبک به سطح مهم (هم‌پوشانی: "+"+".join(pb["levels"][:3])+")")
+        elif pb["overlap"]:
+            score+=2;reasons.append("پولبک به هم‌پوشانی سطوح ("+"+".join(pb["levels"][:2])+")")
         else:
-            score+=1;reasons.append("آسیا شکست")
-            direction=cyc["asia_break"]
+            score+=1;reasons.append("پولبک به سطح "+pb["levels"][0])
 
     # ── نقدینگی (تجمع/توزیع قوی) → ۲ ──
     sc=scenario_analysis(symbol)
@@ -655,16 +826,15 @@ def score_candidate(symbol):
         elif sc["scenario"] in ("mild_accum","mild_dist"):
             score+=1;reasons.append("نقدینگی ملایم")
 
-    # ── شکست/ریجکت معتبر امروز → ۲ ──
+    # ── شکست مثلث/کنج معتبر امروز → ۲ ──
     conn=db();c=conn.cursor()
     c.execute("SELECT breakout_type,breakout_ts FROM daily_data WHERE symbol=? AND day=?",(symbol,today_str()))
     r=c.fetchone();conn.close()
     if r and r["breakout_type"] and r["breakout_ts"] and time.time()-r["breakout_ts"]<8*3600:
         bt=r["breakout_type"]
-        score+=2;reasons.append({"breakout_up":"شکست صعودی","breakout_down":"شکست نزولی",
-                                  "reject_top":"ریجکت سقف","reject_bottom":"ریجکت کف"}.get(bt,"شکست"))
+        score+=2;reasons.append("شکست الگو ("+bt+")")
         if not direction:
-            direction="bull" if bt in ("breakout_up","reject_bottom") else "bear"
+            direction="bull" if "up" in bt else "bear"
 
     # ── سناریو واضح → ۲ ──
     if sc and sc.get("prob",0)>=75:
@@ -699,7 +869,7 @@ def build_premarket_report(candidates):
         for rs in c["reasons"][:4]:
             L.append(f"   • {rs}")
         L.append("")
-    L.append("⚠️ آماری بر اساس رفتار آسیا/لندن، نه سیگنال قطعی. مدیریت ریسک کن.")
+    L.append("⚠️ آماری بر اساس تحلیل تکنیکال، نه سیگنال قطعی. مدیریت ریسک کن.")
     return "\n".join(L)
 
 def run_premarket_scan(symbols):
@@ -763,60 +933,42 @@ def scan_loop():
         try:
             if time.time()-sym_reload>6*3600:
                 symbols=load_symbols();SCAN_SYMBOLS=symbols;sym_reload=time.time()
-            sess=current_session();t0=time.time();cycle_alerts=[]
+            sess=current_session();t0=time.time();pattern_alerts=[]
             for i,sym in enumerate(symbols):
                 try:
                     kl15=klines(sym,"15m",30)
-                    # ── جمع‌آوری نقدینگی (همه سشن‌ها، بی‌صدا — فقط ثبت) ──
+                    # ── جمع‌آوری نقدینگی (بی‌صدا) ──
                     liq=analyze_liquidity(kl15)
                     if liq and liq["flow"]!="none":
                         record_liquidity(sym,liq["flow"],liq["cvd"],liq["rvol"],liq["chg"])
 
-                    # ── جمع‌آوری شکست/ریجکت (بی‌صدا — فقط ثبت برای امتیازدهی) ──
-                    kl1h_br=klines(sym,"1h",30)
-                    br=detect_breakout_rejection(kl1h_br)
-                    if br:
+                    # ── الگوی مثلث/کنج روی ۱ ساعته + شکست با حجم (هشدار لحظه‌ای) ──
+                    kl1h=klines(sym,"1h",60)
+                    pt=detect_triangle_wedge(kl1h)
+                    if pt and can_alert(sym,"br_alerts",BR_COOLDOWN):
+                        # ثبت برای امتیاز Pre-Market
                         conn=db();c=conn.cursor()
+                        btype=f"{pt['pattern']}_{pt['break_dir']}"
                         c.execute("""INSERT INTO daily_data(symbol,day,breakout_type,breakout_ts)
                             VALUES(?,?,?,?) ON CONFLICT(symbol,day) DO UPDATE SET breakout_type=?,breakout_ts=?""",
-                            (sym,today_str(),br["type"],time.time(),br["type"],time.time()))
+                            (sym,today_str(),btype,time.time(),btype,time.time()))
                         conn.commit();conn.close()
+                        pattern_alerts.append((sym,pt))
 
-                    # ── چرخه سه‌سشنه ──
-                    if sess=="asia":
-                        kl1h=klines(sym,"1h",30);ab=detect_asia_break(kl1h)
-                        if ab:upsert_asia(sym,ab["direction"],ab["method"],ab["level"])
-                    elif sess=="london":
-                        cyc=get_cycle(sym)
-                        if cyc and cyc["asia_break"] and not cyc["london_pullback"]:
-                            pb=detect_london_pullback(kl15,cyc["asia_break"],cyc["asia_level"])
-                            if pb:upsert_london(sym,pb["quality"])
-                    elif sess=="us":
-                        # ثبت حجم US برای تشخیص «فعال در سشن US» (روز بعد استفاده می‌شود)
-                        if liq:
-                            conn=db();c=conn.cursor()
-                            c.execute("""INSERT INTO daily_data(symbol,day,us_volume) VALUES(?,?,?)
-                                ON CONFLICT(symbol,day) DO UPDATE SET us_volume=us_volume+?""",
-                                (sym,today_str(),liq["rvol"],liq["rvol"]))
-                            conn.commit();conn.close()
-                        # چرخه US لحظه‌ای (این مهم است و وین‌ریت دارد — می‌ماند)
-                        cyc=get_cycle(sym)
-                        if cyc and cyc["asia_break"] and cyc["london_pullback"] and not cyc["us_move"]:
-                            kl5=klines(sym,"5m",20);mv=detect_us_move(kl15,kl5,cyc["asia_break"])
-                            if mv and can_alert(sym):
-                                upsert_us(sym)
-                                conn=db();c=conn.cursor()
-                                c.execute("INSERT INTO history(symbol,day,completed,direction,ts) VALUES(?,?,1,?,?)",(sym,today_str(),cyc["asia_break"],time.time()))
-                                conn.commit();conn.close()
-                                cycle_alerts.append((sym,cyc,mv))
+                    # ── ثبت حجم US برای «فعال در سشن US» ──
+                    if sess=="us" and liq:
+                        conn=db();c=conn.cursor()
+                        c.execute("""INSERT INTO daily_data(symbol,day,us_volume) VALUES(?,?,?)
+                            ON CONFLICT(symbol,day) DO UPDATE SET us_volume=us_volume+?""",
+                            (sym,today_str(),liq["rvol"],liq["rvol"]))
+                        conn.commit();conn.close()
                 except Exception:
                     pass
                 if i%8==0:time.sleep(0.4)
-            # ── فقط چرخه US لحظه‌ای ارسال می‌شود (نقدینگی/شکست لحظه‌ای حذف شد) ──
-            cycle_alerts.sort(key=lambda x:(x[1]["london_quality"]!="healthy",-x[2]["strength"]))
-            for sym,cyc,mv in cycle_alerts:
-                broadcast(build_stage3_message(sym,cyc,mv));time.sleep(0.5)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه‌US={len(cycle_alerts)} (نقدینگی/شکست در حال جمع‌آوری)")
+            # ── ارسال هشدار شکست الگو (حداکثر ۸ تا که spam نشه) ──
+            for sym,pt in pattern_alerts[:8]:
+                broadcast(build_pattern_message(sym,pt));time.sleep(0.5)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s شکست‌الگو={len(pattern_alerts)}")
         except Exception as e:
             print(f"[!] scan: {e}")
         time.sleep(SCAN_INTERVAL)
