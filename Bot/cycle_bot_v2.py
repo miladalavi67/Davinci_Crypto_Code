@@ -44,6 +44,9 @@ ALERT_COOLDOWN = 45 * 60
 LIQ_COOLDOWN   = 60 * 60
 BR_COOLDOWN    = 60 * 60
 
+# لیست نمادها (برای دسترسی session_alert_loop به اسکن Pre-Market)
+SCAN_SYMBOLS = []
+
 DISCLAIMER = ("⚠️ <b>سلب مسئولیت:</b> ابزار آموزشی/اطلاعاتی، نه سیگنال مالی. "
               "تحلیل‌ها آماری و بر اساس رفتار گذشته‌اند. مسئولیت معاملات با خودت است.")
 
@@ -85,6 +88,13 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS liq_alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
     c.execute("""CREATE TABLE IF NOT EXISTS br_alerts(symbol TEXT PRIMARY KEY, last_ts REAL)""")
+    # داده روزانه هر ارز برای امتیازدهی Pre-Market
+    c.execute("""CREATE TABLE IF NOT EXISTS daily_data(
+        symbol TEXT, day TEXT,
+        us_volume REAL DEFAULT 0,       -- حجم تجمعی در سشن US (روز قبل، برای فعال بودن)
+        breakout_type TEXT,             -- آخرین شکست/ریجکت
+        breakout_ts REAL,
+        PRIMARY KEY(symbol, day))""")
     c.execute("""CREATE TABLE IF NOT EXISTS state(k TEXT PRIMARY KEY, v TEXT)""")
     conn.commit(); conn.close()
 
@@ -158,7 +168,8 @@ def panel_keyboard(is_admin=False):
     rows=[
         ["📊 آمار","📅 رویداد اقتصادی"],
         ["🔄 چرخه BTC","💧 نقدینگی BTC"],
-        ["❓ راهنما","🔕 لغو عضویت"],
+        ["😱 احساسات بازار","❓ راهنما"],
+        ["🔕 لغو عضویت"],
     ]
     if is_admin:
         rows.append(["👥 اعضا","🔧 آمار ادمین"])
@@ -237,6 +248,35 @@ def fetch_btc_news():
         return "\n".join(out)
     except Exception:
         return None
+
+
+def fetch_fear_greed():
+    """شاخص ترس و طمع (Fear & Greed Index) — رایگان، بدون کلید"""
+    try:
+        d=http_get("https://api.alternative.me/fng/?limit=1")
+        if not d or "data" not in d or not d["data"]:return None
+        entry=d["data"][0]
+        val=int(entry["value"])
+        # دسته‌بندی فارسی + تفسیر
+        if val<25:
+            label="ترس شدید 😱";icon="😱";interp="تریدرها خیلی ترسیدن — معمولاً نقطه برگشت/فرصت خرید (دیدگاه معکوس)"
+        elif val<45:
+            label="ترس 😟";icon="😟";interp="فضای محتاطانه — بازار نگران است"
+        elif val<55:
+            label="خنثی 😐";icon="😐";interp="بازار بی‌جهت — احساسات متعادل"
+        elif val<75:
+            label="طمع 🤑";icon="🤑";interp="فضای مثبت — ولی مراقب اشباع باش"
+        else:
+            label="طمع شدید 🤯";icon="🤯";interp="تریدرها حریص شدن — احتیاط، احتمال اصلاح (دیدگاه معکوس)"
+        return {"value":val,"label":label,"icon":icon,"interp":interp}
+    except Exception:
+        return None
+
+def fear_greed_text():
+    fg=fetch_fear_greed()
+    if not fg:return None
+    return (f"{fg['icon']} <b>احساسات بازار:</b> {fg['label']} ({fg['value']}/۱۰۰)\n"
+            f"   {fg['interp']}")
 
 
 # ═══════════ ابزار تحلیل ═══════════
@@ -474,6 +514,7 @@ def build_liquidity_message(symbol,liq,sc):
 PANEL_MAP={
     "📊 آمار":"/stats","📅 رویداد اقتصادی":"/econ",
     "🔄 چرخه BTC":"/cycle BTC","💧 نقدینگی BTC":"/liq BTC",
+    "😱 احساسات بازار":"/sentiment",
     "❓ راهنما":"/help","🔕 لغو عضویت":"/stop",
     "👥 اعضا":"/members","🔧 آمار ادمین":"/admin",
 }
@@ -498,6 +539,10 @@ def handle_command(cid,un,text):
         e=next_econ_event()
         if e:tg_send(cid,f"📅 رویداد بعدی: <b>{e['name']}</b>\nتاریخ: {e['date']} ({e['days']} روز دیگر)")
         else:tg_send(cid,"رویدادی ثبت نشده.")
+    elif text.startswith("/sentiment"):
+        fg=fear_greed_text()
+        if fg:tg_send(cid,fg)
+        else:tg_send(cid,"شاخص احساسات در دسترس نیست (بعداً امتحان کن).")
     elif text.startswith("/cycle"):
         parts=text.split()
         if len(parts)>=2:
@@ -569,6 +614,107 @@ def poll_updates():
             print(f"[!] poll: {e}");time.sleep(5)
 
 
+# ═══════════ امتیازدهی و گزارش Pre-Market ═══════════
+# ارزهای فعال در سشن US بر اساس حجم بالا تشخیص داده می‌شوند (پویا، نه لیست ثابت)
+def is_us_active(symbol):
+    """آیا این ارز در سشن US (روز اخیر) حجم بالایی داشته؟"""
+    conn=db();c=conn.cursor()
+    c.execute("SELECT us_volume FROM daily_data WHERE symbol=? ORDER BY day DESC LIMIT 1",(symbol,))
+    r=c.fetchone();conn.close()
+    return (r["us_volume"] if r else 0)
+
+def score_candidate(symbol):
+    """
+    امتیاز ۰ تا ۱۰ برای ارزش ترید یک ارز در Pre-Market.
+    بر اساس داده‌ای که در آسیا/لندن جمع شده.
+    """
+    score=0;reasons=[];direction=None
+    cyc=get_cycle(symbol)
+
+    # ── چرخه کامل (آسیا شکست + لندن پولبک سالم) → ۳ ──
+    if cyc and cyc["asia_break"]:
+        if cyc["london_pullback"] and cyc["london_quality"]=="healthy":
+            score+=3;reasons.append("چرخه کامل (آسیا+لندن سالم)")
+            direction=cyc["asia_break"]
+        elif cyc["london_pullback"]:
+            score+=2;reasons.append("چرخه (پولبک معمولی)")
+            direction=cyc["asia_break"]
+        else:
+            score+=1;reasons.append("آسیا شکست")
+            direction=cyc["asia_break"]
+
+    # ── نقدینگی (تجمع/توزیع قوی) → ۲ ──
+    sc=scenario_analysis(symbol)
+    if sc:
+        if sc["scenario"]=="accumulation" and sc["prob"]>=70:
+            score+=2;reasons.append(f"تجمع پول ({sc['prob']}٪)")
+            if not direction:direction="bull"
+        elif sc["scenario"]=="distribution" and sc["prob"]>=70:
+            score+=2;reasons.append(f"توزیع پول ({sc['prob']}٪)")
+            if not direction:direction="bear"
+        elif sc["scenario"] in ("mild_accum","mild_dist"):
+            score+=1;reasons.append("نقدینگی ملایم")
+
+    # ── شکست/ریجکت معتبر امروز → ۲ ──
+    conn=db();c=conn.cursor()
+    c.execute("SELECT breakout_type,breakout_ts FROM daily_data WHERE symbol=? AND day=?",(symbol,today_str()))
+    r=c.fetchone();conn.close()
+    if r and r["breakout_type"] and r["breakout_ts"] and time.time()-r["breakout_ts"]<8*3600:
+        bt=r["breakout_type"]
+        score+=2;reasons.append({"breakout_up":"شکست صعودی","breakout_down":"شکست نزولی",
+                                  "reject_top":"ریجکت سقف","reject_bottom":"ریجکت کف"}.get(bt,"شکست"))
+        if not direction:
+            direction="bull" if bt in ("breakout_up","reject_bottom") else "bear"
+
+    # ── سناریو واضح → ۲ ──
+    if sc and sc.get("prob",0)>=75:
+        score+=2;reasons.append("سناریو واضح")
+    elif sc and sc.get("prob",0)>=65:
+        score+=1
+
+    # ── فعال در سشن US (حجم بالا) → ۱ ──
+    if is_us_active(symbol)>0:
+        score+=1;reasons.append("فعال در سشن US")
+
+    return {"symbol":symbol,"score":min(score,10),"reasons":reasons,"direction":direction}
+
+def build_premarket_report(candidates):
+    """گزارش Pre-Market از بهترین ارزها (امتیاز ۵+)"""
+    # شاخص احساسات بازار (در ابتدای گزارش)
+    fg=fear_greed_text()
+    header=["⏰ <b>گزارش Pre-Market US</b>"]
+    if fg:header.append(fg+"\n")
+
+    qualified=[c for c in candidates if c["score"]>=5]
+    qualified.sort(key=lambda x:-x["score"])
+    if not qualified:
+        return "\n".join(header)+"\n\nامروز ارز با امتیاز کافی (۵+) پیدا نشد. بازار شرایط واضحی ندارد — احتیاط."
+    medals=["🥇","🥈","🥉"]+["▫️"]*20
+    L=header+[f"🎯 {len(qualified)} ارز ارزشمند امروز:\n"]
+    for i,c in enumerate(qualified):
+        coin=c["symbol"].replace("USDT","")
+        dir_fa="صعودی 📈" if c["direction"]=="bull" else "نزولی 📉" if c["direction"]=="bear" else "نامشخص"
+        L.append(f"{medals[i]} <b>{coin}</b> — امتیاز {c['score']}/۱۰")
+        L.append(f"   جهت محتمل: {dir_fa}")
+        for rs in c["reasons"][:4]:
+            L.append(f"   • {rs}")
+        L.append("")
+    L.append("⚠️ آماری بر اساس رفتار آسیا/لندن، نه سیگنال قطعی. مدیریت ریسک کن.")
+    return "\n".join(L)
+
+def run_premarket_scan(symbols):
+    """همه ارزها را امتیاز می‌دهد و گزارش را به همه می‌فرستد"""
+    cands=[]
+    for sym in symbols:
+        try:
+            sc=score_candidate(sym)
+            if sc["score"]>=5:cands.append(sc)
+        except Exception:pass
+    report=build_premarket_report(cands)
+    broadcast(report)
+    print(f"[+] گزارش Pre-Market ارسال شد ({len([c for c in cands if c['score']>=5])} ارز).")
+
+
 # ═══════════ هشدارهای زمان‌بندی‌شده (تایم US + اقتصاد) ═══════════
 def session_alert_loop():
     """هشدار تایم‌های US و رویدادهای اقتصادی"""
@@ -578,7 +724,7 @@ def session_alert_loop():
             last_sub=get_state("last_us_sub","")
             if sub and sub!=last_sub:
                 set_state("last_us_sub",sub)
-                msgs={"premarket":"⏰ <b>Pre-Market US</b> — یک ساعت تا باز شدن بازار آمریکا. آماده شو و چرخه‌ها را چک کن.",
+                msgs={"premarket":"⏰ <b>Pre-Market US</b> — یک ساعت تا باز شدن بازار آمریکا.",
                       "open":"🔔 <b>US Open</b> شروع شد (Killzone) — بهترین زمان setup. مراقب باش.",
                       "lunch":"🍽 <b>US Lunch</b> — معمولاً کم‌نوسان، احتیاط در ورود.",
                       "power":"⚡ <b>Power Hour</b> شروع شد (Killzone) — حرکت‌های قوی پایان روز محتمل."}
@@ -589,6 +735,11 @@ def session_alert_loop():
                     if ea:broadcast(ea)
                     news=fetch_btc_news()
                     if news:broadcast(news)
+                # گزارش معرفی ارزها فقط در Pre-Market (یک‌بار در روز)
+                if sub=="premarket" and get_state("premarket_day","")!=today_str():
+                    set_state("premarket_day",today_str())
+                    if SCAN_SYMBOLS:
+                        run_premarket_scan(SCAN_SYMBOLS)
             elif not sub and last_sub:
                 set_state("last_us_sub","")
 
@@ -605,42 +756,50 @@ def session_alert_loop():
 
 # ═══════════ حلقه اسکن اصلی ═══════════
 def scan_loop():
-    symbols=load_symbols();print(f"[+] {len(symbols)} نماد.")
+    global SCAN_SYMBOLS
+    symbols=load_symbols();SCAN_SYMBOLS=symbols;print(f"[+] {len(symbols)} نماد.")
     sym_reload=time.time()
     while True:
         try:
             if time.time()-sym_reload>6*3600:
-                symbols=load_symbols();sym_reload=time.time()
-            sess=current_session();t0=time.time();cycle_alerts=[];liq_alerts=[];br_alerts=[]
+                symbols=load_symbols();SCAN_SYMBOLS=symbols;sym_reload=time.time()
+            sess=current_session();t0=time.time();cycle_alerts=[]
             for i,sym in enumerate(symbols):
                 try:
-                    # رصد نقدینگی (همیشه، همه سشن‌ها)
                     kl15=klines(sym,"15m",30)
+                    # ── جمع‌آوری نقدینگی (همه سشن‌ها، بی‌صدا — فقط ثبت) ──
                     liq=analyze_liquidity(kl15)
                     if liq and liq["flow"]!="none":
                         record_liquidity(sym,liq["flow"],liq["cvd"],liq["rvol"],liq["chg"])
-                        # سناریو: اگر ورود/خروج مکرر بود، هشدار مستقل
-                        sc=scenario_analysis(sym)
-                        if sc and sc["scenario"] in ("accumulation","distribution") and sc["prob"]>=70:
-                            if can_alert(sym,"liq_alerts",LIQ_COOLDOWN):
-                                liq_alerts.append((sym,liq,sc))
 
-                    # شکست محدوده / ریجکت روی ۱ ساعته (با تأیید پول) — هر ساعت یک‌بار
+                    # ── جمع‌آوری شکست/ریجکت (بی‌صدا — فقط ثبت برای امتیازدهی) ──
                     kl1h_br=klines(sym,"1h",30)
                     br=detect_breakout_rejection(kl1h_br)
-                    if br and can_alert(sym,"br_alerts",BR_COOLDOWN):
-                        br_alerts.append((sym,br))
+                    if br:
+                        conn=db();c=conn.cursor()
+                        c.execute("""INSERT INTO daily_data(symbol,day,breakout_type,breakout_ts)
+                            VALUES(?,?,?,?) ON CONFLICT(symbol,day) DO UPDATE SET breakout_type=?,breakout_ts=?""",
+                            (sym,today_str(),br["type"],time.time(),br["type"],time.time()))
+                        conn.commit();conn.close()
 
-                    # چرخه سه‌سشنه
+                    # ── چرخه سه‌سشنه ──
                     if sess=="asia":
-                        kl1h=klines(sym,"1h",30);br=detect_asia_break(kl1h)
-                        if br:upsert_asia(sym,br["direction"],br["method"],br["level"])
+                        kl1h=klines(sym,"1h",30);ab=detect_asia_break(kl1h)
+                        if ab:upsert_asia(sym,ab["direction"],ab["method"],ab["level"])
                     elif sess=="london":
                         cyc=get_cycle(sym)
                         if cyc and cyc["asia_break"] and not cyc["london_pullback"]:
                             pb=detect_london_pullback(kl15,cyc["asia_break"],cyc["asia_level"])
                             if pb:upsert_london(sym,pb["quality"])
                     elif sess=="us":
+                        # ثبت حجم US برای تشخیص «فعال در سشن US» (روز بعد استفاده می‌شود)
+                        if liq:
+                            conn=db();c=conn.cursor()
+                            c.execute("""INSERT INTO daily_data(symbol,day,us_volume) VALUES(?,?,?)
+                                ON CONFLICT(symbol,day) DO UPDATE SET us_volume=us_volume+?""",
+                                (sym,today_str(),liq["rvol"],liq["rvol"]))
+                            conn.commit();conn.close()
+                        # چرخه US لحظه‌ای (این مهم است و وین‌ریت دارد — می‌ماند)
                         cyc=get_cycle(sym)
                         if cyc and cyc["asia_break"] and cyc["london_pullback"] and not cyc["us_move"]:
                             kl5=klines(sym,"5m",20);mv=detect_us_move(kl15,kl5,cyc["asia_break"])
@@ -653,17 +812,11 @@ def scan_loop():
                 except Exception:
                     pass
                 if i%8==0:time.sleep(0.4)
-            # ارسال هشدارها
+            # ── فقط چرخه US لحظه‌ای ارسال می‌شود (نقدینگی/شکست لحظه‌ای حذف شد) ──
             cycle_alerts.sort(key=lambda x:(x[1]["london_quality"]!="healthy",-x[2]["strength"]))
             for sym,cyc,mv in cycle_alerts:
                 broadcast(build_stage3_message(sym,cyc,mv));time.sleep(0.5)
-            liq_alerts.sort(key=lambda x:-x[2]["prob"])
-            for sym,liq,sc in liq_alerts[:10]:  # حداکثر ۱۰ تا که spam نشه
-                broadcast(build_liquidity_message(sym,liq,sc));time.sleep(0.5)
-            # شکست/ریجکت (حداکثر ۸ تا در هر اسکن)
-            for sym,br in br_alerts[:8]:
-                broadcast(build_breakout_message(sym,br));time.sleep(0.5)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه={len(cycle_alerts)} نقدینگی={len(liq_alerts)} شکست={len(br_alerts)}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s چرخه‌US={len(cycle_alerts)} (نقدینگی/شکست در حال جمع‌آوری)")
         except Exception as e:
             print(f"[!] scan: {e}")
         time.sleep(SCAN_INTERVAL)
