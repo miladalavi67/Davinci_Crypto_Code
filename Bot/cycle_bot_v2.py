@@ -38,6 +38,7 @@ ADMIN_CHAT = os.environ.get("ADMIN_CHAT", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "300"))
 NEWS_API   = os.environ.get("NEWS_API", "")   # کلید cryptopanic (اختیاری)
 BASE = "https://fapi.binance.com"
+SPOT_BASE = "https://api.binance.com"
 TG   = f"https://api.telegram.org/bot{TOKEN}"
 DB_FILE = "cycle_bot.db"
 ALERT_COOLDOWN = 45 * 60
@@ -168,8 +169,8 @@ def panel_keyboard(is_admin=False):
     rows=[
         ["📊 آمار","📅 رویداد اقتصادی"],
         ["📐 الگوی BTC","💧 نقدینگی BTC"],
-        ["😱 احساسات بازار","❓ راهنما"],
-        ["🔕 لغو عضویت"],
+        ["🟢 پیشنهاد اسپات","😱 احساسات بازار"],
+        ["❓ راهنما","🔕 لغو عضویت"],
     ]
     if is_admin:
         rows.append(["👥 اعضا","🔧 آمار ادمین"])
@@ -801,11 +802,168 @@ def build_liquidity_message(symbol,liq,sc):
     return "\n".join(L)
 
 
+# ═══════════ بخش اسپات (Spot) — نوسان کوتاه ۲-۳ روزه ═══════════
+def spot_get(path):
+    """درخواست به API اسپات بایننس"""
+    return http_get(f"{SPOT_BASE}{path}")
+
+def spot_klines(symbol, interval, limit=200):
+    return spot_get(f"/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}")
+
+_spot_symbols_cache={"ts":0,"list":[]}
+def load_spot_symbols(top=50):
+    """۵۰ ارز اول اسپات بر اساس حجم دلاری ۲۴ ساعته (USDT)"""
+    now=time.time()
+    if _spot_symbols_cache["list"] and now-_spot_symbols_cache["ts"]<6*3600:
+        return _spot_symbols_cache["list"]
+    data=spot_get("/api/v3/ticker/24hr")
+    if not data:return _spot_symbols_cache["list"] or []
+    # فقط جفت‌های USDT، حذف اهرم‌دارها و استیبل‌ها
+    skip=("UPUSDT","DOWNUSDT","BULLUSDT","BEARUSDT")
+    stables=("USDCUSDT","FDUSDUSDT","TUSDUSDT","BUSDUSDT","DAIUSDT","EURUSDT")
+    rows=[]
+    for d in data:
+        s=d.get("symbol","")
+        if not s.endswith("USDT"):continue
+        if s in stables or any(x in s for x in skip):continue
+        try:qv=float(d.get("quoteVolume",0))
+        except:qv=0
+        rows.append((s,qv))
+    rows.sort(key=lambda x:-x[1])
+    syms=[s for s,_ in rows[:top]]
+    _spot_symbols_cache["ts"]=now;_spot_symbols_cache["list"]=syms
+    return syms
+
+def rsi_calc(closes, period=14):
+    """RSI ساده"""
+    if len(closes)<period+1:return 50
+    gains=[];losses=[]
+    for i in range(1,len(closes)):
+        ch=closes[i]-closes[i-1]
+        gains.append(max(ch,0));losses.append(max(-ch,0))
+    ag=sum(gains[-period:])/period;al=sum(losses[-period:])/period
+    if al==0:return 100
+    rs=ag/al
+    return 100-(100/(1+rs))
+
+def score_spot(symbol):
+    """
+    امتیاز ۰-۱۰ برای ورود اسپات (نوسان ۲-۳ روزه).
+    منطق: روند میان‌مدت صعودی + پولبک به سطح خوب + RSI سالم + واکنش.
+    """
+    # ۴ ساعته برای روند و سطوح، روزانه برای روند بزرگ
+    kl4=spot_klines(symbol,"4h",200)
+    kld=spot_klines(symbol,"1d",60)
+    if not kl4 or len(kl4)<60 or not kld or len(kld)<30:return None
+    C4=to_candles(kl4);Cd=to_candles(kld)
+    price=C4[-1]["c"]
+    closes4=[c["c"] for c in C4];closesd=[c["c"] for c in Cd]
+
+    score=0;reasons=[]
+
+    # ── ۱. روند میان‌مدت صعودی (۴ساعته بالای EMA50) → ۲ ──
+    e50=ema_series(closes4,50)
+    ema50=e50[-1] if e50 else None
+    if ema50 and price>ema50:
+        score+=2;reasons.append("روند ۴ساعته صعودی (بالای EMA50)")
+    elif ema50 and price>ema50*0.98:
+        score+=1;reasons.append("نزدیک EMA50")
+
+    # ── ۲. روند بزرگ سالم (روزانه بالای EMA20 روزانه) → ۱ ──
+    ed20=ema_series(closesd,20)
+    if ed20 and price>ed20[-1]:
+        score+=1;reasons.append("روند روزانه مثبت")
+
+    # ── ۳. پولبک به سطح خوب (تخفیف، نه قله) → ۳ ──
+    # فاصله از سقف ۲۰ کندل اخیر ۴ساعته
+    recent_high=max(c["h"] for c in C4[-20:])
+    pullback=(recent_high-price)/recent_high
+    if 0.03<=pullback<=0.12:
+        score+=3;reasons.append(f"پولبک سالم ({round(pullback*100,1)}٪ از سقف)")
+    elif 0.01<=pullback<0.03:
+        score+=1;reasons.append("پولبک کوچک")
+    elif pullback>0.12:
+        reasons.append("افت زیاد (احتیاط)")
+
+    # ── ۴. RSI سالم (نه اشباع خرید) → ۲ ──
+    r=rsi_calc(closes4)
+    if 40<=r<=60:
+        score+=2;reasons.append(f"RSI متعادل ({round(r)})")
+    elif 35<=r<65:
+        score+=1;reasons.append(f"RSI قابل‌قبول ({round(r)})")
+    elif r>70:
+        reasons.append(f"RSI اشباع خرید ({round(r)}) ⚠️")
+
+    # ── ۵. واکنش مثبت (کندل برگشتی) → ۲ ──
+    last=C4[-1]
+    body=abs(last["c"]-last["o"]);rng=last["h"]-last["l"]
+    dn_wick=min(last["c"],last["o"])-last["l"]
+    if rng>0 and dn_wick>body and last["c"]>last["o"]:
+        score+=2;reasons.append("کندل برگشتی صعودی")
+    elif last["c"]>last["o"]:
+        score+=1
+
+    # محاسبه حد سود و ضرر (برای ۲-۳ روز)
+    # ATR ساده روی ۴ساعته
+    trs=[]
+    for i in range(1,len(C4)):
+        trs.append(max(C4[i]["h"]-C4[i]["l"],abs(C4[i]["h"]-C4[i-1]["c"]),abs(C4[i]["l"]-C4[i-1]["c"])))
+    atr=sum(trs[-14:])/14 if len(trs)>=14 else (sum(trs)/len(trs) if trs else price*0.02)
+
+    entry=price
+    stop=round(price-atr*1.5,4)        # حد ضرر: ۱.۵ برابر ATR پایین
+    target=round(price+atr*3,4)        # حد سود: ۳ برابر ATR بالا (R/R=۲)
+    rr=round((target-entry)/(entry-stop),1) if entry>stop else 0
+
+    return {"symbol":symbol,"score":min(score,10),"reasons":reasons,
+            "price":round(price,4),"entry":round(entry,4),"stop":stop,
+            "target":target,"rr":rr,"rsi":round(r)}
+
+def build_spot_report(candidates):
+    """گزارش پیشنهاد اسپات از بهترین‌ها (امتیاز ۶+)"""
+    qualified=[c for c in candidates if c and c["score"]>=6]
+    qualified.sort(key=lambda x:-x["score"])
+    qualified=qualified[:5]  # حداکثر ۵ تا
+    fg=fear_greed_text()
+    header=["🟢 <b>پیشنهاد اسپات (نوسان ۲-۳ روزه)</b>"]
+    if fg:header.append(fg+"\n")
+    if not qualified:
+        return "\n".join(header)+"\n\nالان ارز با شرایط خوب (امتیاز ۶+) برای اسپات پیدا نشد. صبر بهتر از ورود بد است."
+    medals=["🥇","🥈","🥉","▫️","▫️"]
+    L=header+[f"🎯 {len(qualified)} ارز با بهترین شرایط:\n"]
+    for i,c in enumerate(qualified):
+        coin=c["symbol"].replace("USDT","")
+        L.append(f"{medals[i]} <b>{coin}</b> — امتیاز {c['score']}/۱۰")
+        L.append(f"   💵 ورود: ${c['entry']}")
+        L.append(f"   🎯 حد سود: ${c['target']}")
+        L.append(f"   🛑 حد ضرر: ${c['stop']}")
+        L.append(f"   ⚖️ R/R: {c['rr']} · RSI: {c['rsi']}")
+        for rs in c["reasons"][:3]:
+            L.append(f"   • {rs}")
+        L.append("")
+    L.append("⚠️ آماری برای نوسان کوتاه، نه سیگنال قطعی. حد ضرر را رعایت کن.")
+    return "\n".join(L)
+
+def run_spot_scan():
+    """اسکن اسپات و ساخت گزارش"""
+    syms=load_spot_symbols(50)
+    if not syms:return "❌ دریافت لیست ارزهای اسپات ناموفق بود (API اسپات در دسترس نیست)."
+    cands=[]
+    for s in syms:
+        try:
+            sc=score_spot(s)
+            if sc:cands.append(sc)
+        except Exception:pass
+        time.sleep(0.05)
+    return build_spot_report(cands)
+
+
 # ═══════════ دستورات ═══════════
 # نگاشت متن دکمه‌های پنل دائمی به دستورها
 PANEL_MAP={
     "📊 آمار":"/stats","📅 رویداد اقتصادی":"/econ",
     "📐 الگوی BTC":"/pattern BTC","💧 نقدینگی BTC":"/liq BTC",
+    "🟢 پیشنهاد اسپات":"/spot",
     "😱 احساسات بازار":"/sentiment",
     "❓ راهنما":"/help","🔕 لغو عضویت":"/stop",
     "👥 اعضا":"/members","🔧 آمار ادمین":"/admin",
@@ -823,7 +981,7 @@ def handle_command(cid,un,text):
     elif text.startswith("/stop"):
         remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
     elif text.startswith("/help") or text.startswith("/menu"):
-        h="📋 <b>منوی ربات</b>\n\nاز دکمه‌های زیر استفاده کن، یا دستورها را تایپ کن:\n/pattern ETH — الگوی مثلث/کنج یک ارز\n/liq ETH — نقدینگی یک ارز"
+        h="📋 <b>منوی ربات</b>\n\nاز دکمه‌های زیر استفاده کن، یا دستورها را تایپ کن:\n/pattern ETH — الگوی مثلث/کنج یک ارز\n/liq ETH — نقدینگی یک ارز\n/spot — پیشنهاد اسپات (نوسان ۲-۳ روزه)\n/sentiment — احساسات بازار"
         tg_send(cid,h,buttons=main_menu(is_admin))
     elif text.startswith("/stats"):
         tg_send(cid,f"👥 اعضا: {member_count()}\n🕐 سشن: {current_session()}")
@@ -835,6 +993,14 @@ def handle_command(cid,un,text):
         fg=fear_greed_text()
         if fg:tg_send(cid,fg)
         else:tg_send(cid,"شاخص احساسات در دسترس نیست (بعداً امتحان کن).")
+    elif text.startswith("/spot"):
+        tg_send(cid,"🔍 در حال اسکن اسپات (۵۰ ارز اول)... چند لحظه صبر کن.")
+        try:
+            report=run_spot_scan()
+            tg_send(cid,report)
+        except Exception as e:
+            tg_send(cid,f"خطا در اسکن اسپات. بعداً امتحان کن.")
+            print(f"[!] spot scan: {e}")
     elif text.startswith("/pattern"):
         parts=text.split()
         if len(parts)>=2:
@@ -1031,6 +1197,12 @@ def session_alert_loop():
                     set_state("premarket_day",today_str())
                     if SCAN_SYMBOLS:
                         run_premarket_scan(SCAN_SYMBOLS)
+                    # گزارش اسپات روزانه (یک‌بار، همراه Pre-Market)
+                    try:
+                        spot_report=run_spot_scan()
+                        broadcast(spot_report)
+                    except Exception as e:
+                        print(f"[!] spot daily: {e}")
             elif not sub and last_sub:
                 set_state("last_us_sub","")
 
