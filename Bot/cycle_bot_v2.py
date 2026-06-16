@@ -429,90 +429,206 @@ def ema_series(values, period):
     return out
 
 
-# ── تشخیص الگوی مثلث / کنج روی ۱ ساعته + شکست با حجم ──
-def find_pivots(C, left=2, right=2):
-    """سقف‌ها و کف‌های محلی (pivot highs/lows)"""
-    highs=[];lows=[]
-    for i in range(left,len(C)-right):
-        h=C[i]["h"];l=C[i]["l"]
-        if all(h>=C[j]["h"] for j in range(i-left,i)) and all(h>=C[j]["h"] for j in range(i+1,i+right+1)):
-            highs.append((i,h))
-        if all(l<=C[j]["l"] for j in range(i-left,i)) and all(l<=C[j]["l"] for j in range(i+1,i+right+1)):
-            lows.append((i,l))
-    return highs,lows
-
-def detect_triangle_wedge(kl1h):
-    """
-    الگوی مثلث/کنج: خط روی سقف‌ها + خط روی کف‌ها.
-    اگر همگرا شدند → الگو هست. شکست با حجم → سیگنال.
-    """
-    if not kl1h or len(kl1h)<40:return None
-    C=to_candles(kl1h);price=C[-1]["c"]
-    seg=C[-40:]
-    highs,lows=find_pivots(seg,left=2,right=2)
-    if len(highs)<2 or len(lows)<2:return None
-
-    # خط روند روی سقف‌ها و کف‌ها (رگرسیون روی pivotها)
-    hx=[i for i,_ in highs];hy=[v for _,v in highs]
-    lx=[i for i,_ in lows];ly=[v for _,v in lows]
-    rh=lin_reg_xy(hx,hy);rl=lin_reg_xy(lx,ly)
-    if not rh or not rl:return None
-
-    n=len(seg)
-    upper_now=rh["slope"]*(n-1)+rh["intercept"]
-    lower_now=rl["slope"]*(n-1)+rl["intercept"]
-    upper_start=rh["intercept"];lower_start=rl["intercept"]
-    width_start=upper_start-lower_start
-    width_now=upper_now-lower_now
-    if width_start<=0 or width_now<=0:return None
-
-    # همگرایی: عرض الان کمتر از ۷۰٪ عرض اول
-    converging=width_now<width_start*0.7
-    if not converging:return None
-
-    sh=rh["slope"];sl=rl["slope"]
-    # تشخیص نوع الگو
-    avg=price
-    sh_n=sh/avg;sl_n=sl/avg  # شیب نرمال
-    if abs(sh_n)<0.0003 and sl_n>0.0003:
-        ptype="asc_triangle";pname="مثلث صعودی"
-    elif abs(sl_n)<0.0003 and sh_n<-0.0003:
-        ptype="desc_triangle";pname="مثلث نزولی"
-    elif sh_n<-0.0002 and sl_n>0.0002:
-        ptype="sym_triangle";pname="مثلث متقارن"
-    elif sh_n>0.0002 and sl_n>0.0002:
-        ptype="rising_wedge";pname="کنج صعودی"
-    elif sh_n<-0.0002 and sl_n<-0.0002:
-        ptype="falling_wedge";pname="کنج نزولی"
-    else:
-        ptype="triangle";pname="مثلث"
-
-    # نقدینگی برای تأیید
-    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
-    rvol=vols[-1]/avg_v if avg_v>0 else 1
-    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-5:])
-
-    # شکست: قیمت از خط بالا یا پایین زده بیرون + حجم
-    broke=None
-    if price>upper_now and rvol>=1.6 and cvd>0:
-        broke="up"
-    elif price<lower_now and rvol>=1.6 and cvd<0:
-        broke="down"
-    if not broke:return None  # الگو هست ولی هنوز شکست معتبر نشده
-
-    return {"pattern":ptype,"pname":pname,"break_dir":broke,
-            "upper":round(upper_now,4),"lower":round(lower_now,4),
-            "price":price,"rvol":round(rvol,2),"cvd":round(cvd,1)}
-
+# ═══════════ تشخیص الگو با ZigZag (حرفه‌ای) ═══════════
 def lin_reg_xy(xs,ys):
-    """رگرسیون خطی روی نقاط دلخواه (x,y)"""
+    """رگرسیون خطی + R² (کیفیت برازش)"""
     n=len(xs)
     if n<2:return None
     sx=sum(xs);sy=sum(ys);sxy=sum(xs[i]*ys[i] for i in range(n));sxx=sum(x*x for x in xs)
     den=n*sxx-sx*sx
     if den==0:return None
     slope=(n*sxy-sx*sy)/den;intercept=(sy-slope*sx)/n
-    return {"slope":slope,"intercept":intercept}
+    # R²
+    mean_y=sy/n
+    ss_tot=sum((y-mean_y)**2 for y in ys)
+    ss_res=sum((ys[i]-(slope*xs[i]+intercept))**2 for i in range(n))
+    r2=1-(ss_res/ss_tot) if ss_tot>0 else 0
+    return {"slope":slope,"intercept":intercept,"r2":r2}
+
+
+def zigzag_pivots(C, pct=None):
+    """
+    نقاط چرخش مهم (ZigZag) — فقط چرخش‌های معنادار.
+    اگر pct داده نشود، از نوسان واقعی بازار (ATR) استفاده می‌کند.
+    خروجی: لیست متناوب [(index, price, 'H'|'L'), ...]
+    """
+    if len(C)<10:return []
+    # آستانه تطبیقی بر اساس ATR (نوسان طبیعی همان ارز)
+    if pct is None:
+        trs=[]
+        for i in range(1,len(C)):
+            tr=max(C[i]["h"]-C[i]["l"],abs(C[i]["h"]-C[i-1]["c"]),abs(C[i]["l"]-C[i-1]["c"]))
+            trs.append(tr)
+        atr=sum(trs[-14:])/min(14,len(trs))
+        avg_price=sum(c["c"] for c in C)/len(C)
+        pct=max((atr/avg_price)*1.5, 0.01)  # حداقل ۱٪
+
+    pivots=[]
+    direction=0
+    cur_ext_idx=0;cur_ext_price=C[0]["c"]
+
+    for i in range(1,len(C)):
+        h=C[i]["h"];l=C[i]["l"]
+        if direction>=0:
+            if h>cur_ext_price:
+                cur_ext_price=h;cur_ext_idx=i
+            if l<cur_ext_price*(1-pct):
+                pivots.append((cur_ext_idx,cur_ext_price,"H"))
+                direction=-1;cur_ext_price=l;cur_ext_idx=i
+        else:
+            if l<cur_ext_price:
+                cur_ext_price=l;cur_ext_idx=i
+            if h>cur_ext_price*(1+pct):
+                pivots.append((cur_ext_idx,cur_ext_price,"L"))
+                direction=1;cur_ext_price=h;cur_ext_idx=i
+    return pivots
+
+
+def line_touches(pivots_xy, slope, intercept, tol):
+    """چند pivot واقعاً روی این خط هستند (±tol)"""
+    cnt=0
+    for x,y in pivots_xy:
+        expected=slope*x+intercept
+        if abs(y-expected)/expected<tol:
+            cnt+=1
+    return cnt
+
+
+def detect_triangle_wedge(kl1h):
+    """
+    الگوی مثلث/کنج با ZigZag + تأیید ۳ لمس + کیفیت خط (R²).
+    فقط الگوهای معتبر با شکست حجم‌دار را برمی‌گرداند.
+    """
+    if not kl1h or len(kl1h)<50:return None
+    C=to_candles(kl1h);price=C[-1]["c"]
+    piv=zigzag_pivots(C)
+    if len(piv)<5:return None  # حداقل ۵ چرخش برای یک الگوی معتبر
+
+    highs=[(i,p) for i,p,t in piv if t=="H"]
+    lows=[(i,p) for i,p,t in piv if t=="L"]
+    if len(highs)<3 or len(lows)<3:return None  # حداقل ۳ سقف و ۳ کف
+
+    # فقط ۴ چرخش اخیر هر کدام (الگوی فعلی، نه قدیمی)
+    highs=highs[-4:];lows=lows[-4:]
+    hx=[i for i,_ in highs];hy=[v for _,v in highs]
+    lx=[i for i,_ in lows];ly=[v for _,v in lows]
+    rh=lin_reg_xy(hx,hy);rl=lin_reg_xy(lx,ly)
+    if not rh or not rl:return None
+
+    # کیفیت خط: R² باید بالا باشد (نقاط واقعاً روی خط)
+    if rh["r2"]<0.6 or rl["r2"]<0.6:return None
+
+    # تأیید ۳ لمس: حداقل ۳ سقف روی خط بالا، ۳ کف روی خط پایین
+    if line_touches(list(zip(hx,hy)),rh["slope"],rh["intercept"],0.012)<3:return None
+    if line_touches(list(zip(lx,ly)),rl["slope"],rl["intercept"],0.012)<3:return None
+
+    n=len(C)
+    upper_now=rh["slope"]*(n-1)+rh["intercept"]
+    lower_now=rl["slope"]*(n-1)+rl["intercept"]
+    # عرض ابتدا و انتهای الگو
+    start_x=min(hx[0],lx[0])
+    upper_start=rh["slope"]*start_x+rh["intercept"]
+    lower_start=rl["slope"]*start_x+rl["intercept"]
+    width_start=upper_start-lower_start
+    width_now=upper_now-lower_now
+    if width_start<=0 or width_now<=0:return None
+
+    sh=rh["slope"]/price;sl=rl["slope"]/price  # شیب نرمال‌شده
+    FLAT=0.0002
+
+    # ── تشخیص نوع الگو ──
+    converging=width_now<width_start*0.75
+    if abs(sh)<FLAT and sl>FLAT:
+        ptype="asc_triangle";pname="مثلث صعودی";bias="bull"
+    elif abs(sl)<FLAT and sh<-FLAT:
+        ptype="desc_triangle";pname="مثلث نزولی";bias="bear"
+    elif sh<-FLAT and sl>FLAT and converging:
+        ptype="sym_triangle";pname="مثلث متقارن";bias="neutral"
+    elif sh>FLAT and sl>FLAT and converging:
+        ptype="rising_wedge";pname="کنج صعودی";bias="bear"  # کنج صعودی معمولاً نزولی می‌شکند
+    elif sh<-FLAT and sl<-FLAT and converging:
+        ptype="falling_wedge";pname="کنج نزولی";bias="bull"  # کنج نزولی معمولاً صعودی می‌شکند
+    else:
+        return None  # الگوی واضحی نیست
+
+    # ── نقدینگی برای تأیید شکست ──
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-5:])
+
+    # ── شکست با حجم ──
+    broke=None
+    if price>upper_now*1.001 and rvol>=1.6 and cvd>0:
+        broke="up"
+    elif price<lower_now*0.999 and rvol>=1.6 and cvd<0:
+        broke="down"
+    if not broke:return None
+
+    return {"pattern":ptype,"pname":pname,"break_dir":broke,"bias":bias,
+            "upper":round(upper_now,4),"lower":round(lower_now,4),
+            "price":price,"rvol":round(rvol,2),"cvd":round(cvd,1),
+            "touches_h":line_touches(list(zip(hx,hy)),rh["slope"],rh["intercept"],0.012),
+            "touches_l":line_touches(list(zip(lx,ly)),rl["slope"],rl["intercept"],0.012),
+            "r2":round(min(rh["r2"],rl["r2"]),2)}
+
+
+# ── تشخیص سر و شونه (Head & Shoulders) ──
+def detect_head_shoulders(kl1h):
+    """
+    سر و شونه: ۳ قله که وسطی (سر) بلندتر از دو کناری (شونه‌ها)
+    + نسخه معکوس (کف). شکست خط گردن با حجم → سیگنال.
+    """
+    if not kl1h or len(kl1h)<50:return None
+    C=to_candles(kl1h);price=C[-1]["c"]
+    piv=zigzag_pivots(C)
+    if len(piv)<5:return None
+
+    highs=[(i,p) for i,p,t in piv if t=="H"]
+    lows=[(i,p) for i,p,t in piv if t=="L"]
+
+    vols=[c["vol"] for c in C];avg_v=sum(vols[-21:-1])/20 if len(vols)>=21 else sum(vols)/len(vols)
+    rvol=vols[-1]/avg_v if avg_v>0 else 1
+    deltas=[c["tb"]-(c["vol"]-c["tb"]) for c in C];cvd=sum(deltas[-5:])
+
+    # ── سر و شونه سقف (نزولی) ──
+    if len(highs)>=3:
+        ls,head,rs=highs[-3],highs[-2],highs[-1]  # شونه چپ، سر، شونه راست
+        # سر باید بلندتر از هر دو شونه باشد
+        if head[1]>ls[1] and head[1]>rs[1]:
+            # دو شونه تقریباً هم‌ارتفاع (±3%)
+            if abs(ls[1]-rs[1])/ls[1]<0.03:
+                # خط گردن = کف بین قله‌ها
+                neck_lows=[p for i,p in lows if ls[0]<i<rs[0]]
+                if neck_lows:
+                    neckline=sum(neck_lows)/len(neck_lows)
+                    # شکست زیر خط گردن با حجم
+                    if price<neckline*0.999 and rvol>=1.6 and cvd<0:
+                        return {"pattern":"head_shoulders","pname":"سر و شونه سقف",
+                                "break_dir":"down","bias":"bear","neckline":round(neckline,4),
+                                "price":price,"rvol":round(rvol,2),"cvd":round(cvd,1)}
+
+    # ── سر و شونه معکوس (کف، صعودی) ──
+    if len(lows)>=3:
+        ls,head,rs=lows[-3],lows[-2],lows[-1]
+        # سر باید پایین‌تر از هر دو شونه باشد
+        if head[1]<ls[1] and head[1]<rs[1]:
+            if abs(ls[1]-rs[1])/ls[1]<0.03:
+                neck_highs=[p for i,p in highs if ls[0]<i<rs[0]]
+                if neck_highs:
+                    neckline=sum(neck_highs)/len(neck_highs)
+                    if price>neckline*1.001 and rvol>=1.6 and cvd>0:
+                        return {"pattern":"inv_head_shoulders","pname":"سر و شونه معکوس",
+                                "break_dir":"up","bias":"bull","neckline":round(neckline,4),
+                                "price":price,"rvol":round(rvol,2),"cvd":round(cvd,1)}
+    return None
+
+
+def detect_pattern(kl1h):
+    """تشخیص ترکیبی: اول سر و شونه، بعد مثلث/کنج"""
+    hs=detect_head_shoulders(kl1h)
+    if hs:return hs
+    return detect_triangle_wedge(kl1h)
+
 
 def build_pattern_message(symbol,pt):
     coin=symbol.replace("USDT","")
@@ -522,7 +638,12 @@ def build_pattern_message(symbol,pt):
     L.append(f"💵 ${pt['price']}")
     L.append(f"📐 الگو: {pt['pname']}")
     L.append(f"{ic} جهت شکست: {dir_fa}")
-    L.append(f"📊 با حجم: ✅ تأیید (RVOL {pt['rvol']} · CVD {'+' if pt['cvd']>0 else ''}{pt['cvd']:.0f})")
+    # جزئیات کیفیت (اگر مثلث/کنج بود)
+    if pt.get("touches_h"):
+        L.append(f"✔️ کیفیت: {pt['touches_h']} لمس سقف · {pt['touches_l']} لمس کف · R²={pt['r2']}")
+    if pt.get("neckline"):
+        L.append(f"〰️ خط گردن: ${pt['neckline']}")
+    L.append(f"📊 حجم: ✅ تأیید (RVOL {pt['rvol']} · CVD {'+' if pt['cvd']>0 else ''}{pt['cvd']:.0f})")
     L.append(f"\n⚠️ آماری، نه سیگنال. مدیریت ریسک کن.")
     L.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
     return "\n".join(L)
@@ -719,7 +840,7 @@ def handle_command(cid,un,text):
         if len(parts)>=2:
             sym=parts[1].upper();sym=sym if sym.endswith("USDT") else sym+"USDT"
             kl1h=klines(sym,"1h",60)
-            pt=detect_triangle_wedge(kl1h)
+            pt=detect_pattern(kl1h)
             coin=sym.replace("USDT","")
             if pt:
                 dir_fa="صعودی 🔼" if pt["break_dir"]=="up" else "نزولی 🔽"
@@ -944,7 +1065,7 @@ def scan_loop():
 
                     # ── الگوی مثلث/کنج روی ۱ ساعته + شکست با حجم (هشدار لحظه‌ای) ──
                     kl1h=klines(sym,"1h",60)
-                    pt=detect_triangle_wedge(kl1h)
+                    pt=detect_pattern(kl1h)
                     if pt and can_alert(sym,"br_alerts",BR_COOLDOWN):
                         # ثبت برای امتیاز Pre-Market
                         conn=db();c=conn.cursor()
