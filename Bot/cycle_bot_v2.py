@@ -976,7 +976,7 @@ def handle_command(cid,un,text):
         text=PANEL_MAP[text]
     if text.startswith("/start"):
         add_member(cid,un)
-        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\nاین ربات رصد می‌کند:\n🔄 چرخه سه‌سشنه (آسیا→لندن→US)\n💧 ورود/خروج مکرر نقدینگی\n🔼 شکست محدوده / 🔽 ریجکت (با تأیید پول)\n⏰ تایم‌های مهم US\n📅 رویدادهای اقتصادی\n🎯 ستاپ سایت تحلیل\n\n{DISCLAIMER}\n\n👇 از پنل دکمه‌های پایین استفاده کن:",
+        tg_send(cid,f"✅ خوش آمدی! عضو شدی.\n\n🔔 <b>پیام‌های خودکار:</b>\n⏰ اعلام سشن‌های آمریکا (Pre-Market/Open/Lunch/Power)\n🔬 موقع Pre-Market: تحلیل مولتی‌تایم‌فریم BTC + سناریو سشن US + ارزهای منتخب\n\n🎛 <b>بقیه با دکمه (دستی):</b>\n📐 الگوی مثلث/کنج · 💧 نقدینگی · 🟢 اسپات\n😱 احساسات · 📊 آمار · 📅 اقتصاد\n\n{DISCLAIMER}\n\n👇 از پنل دکمه‌های پایین استفاده کن:",
                 keyboard=panel_keyboard(is_admin))
     elif text.startswith("/stop"):
         remove_member(cid);tg_send(cid,"🔕 لغو شد. /start برای بازگشت.")
@@ -1172,6 +1172,96 @@ def run_premarket_scan(symbols):
     print(f"[+] گزارش Pre-Market ارسال شد ({len([c for c in cands if c['score']>=5])} ارز).")
 
 
+# ── تحلیل مولتی‌تایم‌فریم BTC (برای Pre-Market) ──
+def macd_simple(closes):
+    """MACD ساده: خط، سیگنال"""
+    if len(closes)<35:return None
+    e12=ema_series(closes,12);e26=ema_series(closes,26)
+    if not e12 or not e26:return None
+    macd_line=[e12[i]-e26[i] for i in range(len(e26))]
+    sig=ema_series(macd_line,9)
+    if not sig:return None
+    return macd_line[-1],sig[-1]
+
+def ichimoku_simple(C):
+    """ایچیموکو ساده: موقعیت قیمت نسبت به ابر + تنکان/کیجون"""
+    if len(C)<52:return None
+    highs=[c["h"] for c in C];lows=[c["l"] for c in C];price=C[-1]["c"]
+    def mid(n):return (max(highs[-n:])+min(lows[-n:]))/2
+    tenkan=mid(9);kijun=mid(26)
+    span_a=(tenkan+kijun)/2
+    span_b=mid(52)
+    cloud_top=max(span_a,span_b);cloud_bot=min(span_a,span_b)
+    score=0
+    if price>cloud_top:score+=2;pos="بالای ابر"
+    elif price<cloud_bot:score-=2;pos="زیر ابر"
+    else:pos="داخل ابر"
+    if tenkan>kijun:score+=1
+    else:score-=1
+    if price>kijun:score+=1
+    else:score-=1
+    if score>=3:v="صعودی قوی";b="bull"
+    elif score>=1:v="صعودی";b="bull"
+    elif score<=-3:v="نزولی قوی";b="bear"
+    elif score<=-1:v="نزولی";b="bear"
+    else:v="خنثی";b="neutral"
+    return {"verdict":v,"bias":b,"pos":pos,"score":score}
+
+def build_btc_multitf():
+    """تحلیل مولتی‌تایم‌فریم BTC + سناریو سشن US"""
+    sym="BTCUSDT"
+    kl1=klines(sym,"1h",120)
+    kl4=klines(sym,"4h",120)
+    kl15=klines(sym,"15m",120)
+    if not kl1 or not kl4 or not kl15:return None
+    C1=to_candles(kl1);C4=to_candles(kl4);C15=to_candles(kl15)
+    price=C1[-1]["c"]
+
+    # ۱H ایچیموکو
+    ich=ichimoku_simple(C1)
+    if not ich:return None
+
+    # ۴H: RSI + MACD
+    closes4=[c["c"] for c in C4]
+    rsi4=rsi_calc(closes4)
+    mac=macd_simple(closes4)
+    macd_state="صعودی" if mac and mac[0]>mac[1] else "نزولی"
+    if rsi4>=70:rsi_state="اشباع خرید";rsi_b="bear"
+    elif rsi4<=30:rsi_state="اشباع فروش";rsi_b="bull"
+    elif rsi4>=55:rsi_state="مایل صعود";rsi_b="bull"
+    elif rsi4<=45:rsi_state="مایل نزول";rsi_b="bear"
+    else:rsi_state="خنثی";rsi_b="neutral"
+    macd_b="bull" if macd_state=="صعودی" else "bear"
+
+    # ۱۵M: محدوده (پولبک به سطح)
+    pb=detect_pullback_to_level(kl15)
+    zone_txt=""
+    if pb:
+        zone_txt="نزدیک سطح: "+"+".join(pb["levels"][:3])
+
+    # سناریو: ترکیب جهت‌ها
+    biases=[ich["bias"],rsi_b,macd_b]
+    bull=biases.count("bull");bear=biases.count("bear")
+    if bull>bear:
+        overall="تمایل صعودی 📈"
+        scen=f"اگر بالای ${round(price*1.003)} تثبیت شد → ادامه صعود محتمل"
+    elif bear>bull:
+        overall="تمایل نزولی 📉"
+        scen=f"اگر زیر ${round(price*0.997)} شکست → ادامه نزول محتمل"
+    else:
+        overall="بلاتکلیف (رنج) ⚖️"
+        scen="تا شکست واضح یکی از سطوح، احتیاط"
+
+    L=["🔬 <b>تحلیل مولتی‌تایم‌فریم BTC</b> (Pre-Market)",f"💵 ${price}\n"]
+    L.append(f"☁️ <b>۱H ایچیموکو:</b> {ich['verdict']} ({ich['pos']})")
+    L.append(f"📊 <b>۴H مومنتوم:</b> RSI {round(rsi4)} ({rsi_state}) · MACD {macd_state}")
+    if zone_txt:L.append(f"🎯 <b>۱۵M:</b> {zone_txt}")
+    L.append(f"\n📋 <b>جهت کلی سشن US:</b> {overall}")
+    L.append(f"   {scen}")
+    L.append(f"\n⚠️ آماری بر اساس ۳ تایم‌فریم، نه سیگنال قطعی.")
+    return "\n".join(L)
+
+
 # ═══════════ هشدارهای زمان‌بندی‌شده (تایم US + اقتصاد) ═══════════
 def session_alert_loop():
     """هشدار تایم‌های US و رویدادهای اقتصادی"""
@@ -1192,17 +1282,18 @@ def session_alert_loop():
                     if ea:broadcast(ea)
                     news=fetch_btc_news()
                     if news:broadcast(news)
-                # گزارش معرفی ارزها فقط در Pre-Market (یک‌بار در روز)
+                # گزارش Pre-Market فقط یک‌بار در روز
                 if sub=="premarket" and get_state("premarket_day","")!=today_str():
                     set_state("premarket_day",today_str())
+                    # ۱) تحلیل مولتی‌تایم‌فریم BTC + سناریو US
+                    try:
+                        btc_report=build_btc_multitf()
+                        if btc_report:broadcast(btc_report)
+                    except Exception as e:
+                        print(f"[!] btc multitf: {e}")
+                    # ۲) امتیازدهی ارزهای منتخب
                     if SCAN_SYMBOLS:
                         run_premarket_scan(SCAN_SYMBOLS)
-                    # گزارش اسپات روزانه (یک‌بار، همراه Pre-Market)
-                    try:
-                        spot_report=run_spot_scan()
-                        broadcast(spot_report)
-                    except Exception as e:
-                        print(f"[!] spot daily: {e}")
             elif not sub and last_sub:
                 set_state("last_us_sub","")
 
@@ -1226,7 +1317,7 @@ def scan_loop():
         try:
             if time.time()-sym_reload>6*3600:
                 symbols=load_symbols();SCAN_SYMBOLS=symbols;sym_reload=time.time()
-            sess=current_session();t0=time.time();pattern_alerts=[]
+            sess=current_session();t0=time.time()
             for i,sym in enumerate(symbols):
                 try:
                     kl15=klines(sym,"15m",30)
@@ -1235,18 +1326,18 @@ def scan_loop():
                     if liq and liq["flow"]!="none":
                         record_liquidity(sym,liq["flow"],liq["cvd"],liq["rvol"],liq["chg"])
 
-                    # ── الگوی مثلث/کنج روی ۱ ساعته + شکست با حجم (هشدار لحظه‌ای) ──
+                    # ── الگوی مثلث/کنج روی ۱ ساعته (فقط ثبت داده، بدون هشدار خودکار) ──
+                    # هشدار خودکار حذف شد — الگو فقط با دکمه دستی /pattern چک می‌شود
                     kl1h=klines(sym,"1h",60)
                     pt=detect_pattern(kl1h)
-                    if pt and can_alert(sym,"br_alerts",BR_COOLDOWN):
-                        # ثبت برای امتیاز Pre-Market
+                    if pt:
+                        # ثبت برای امتیاز Pre-Market (داده جمع می‌شود ولی پیام نمی‌رود)
                         conn=db();c=conn.cursor()
                         btype=f"{pt['pattern']}_{pt['break_dir']}"
                         c.execute("""INSERT INTO daily_data(symbol,day,breakout_type,breakout_ts)
                             VALUES(?,?,?,?) ON CONFLICT(symbol,day) DO UPDATE SET breakout_type=?,breakout_ts=?""",
                             (sym,today_str(),btype,time.time(),btype,time.time()))
                         conn.commit();conn.close()
-                        pattern_alerts.append((sym,pt))
 
                     # ── ثبت حجم US برای «فعال در سشن US» ──
                     if sess=="us" and liq:
@@ -1258,10 +1349,8 @@ def scan_loop():
                 except Exception:
                     pass
                 if i%8==0:time.sleep(0.4)
-            # ── ارسال هشدار شکست الگو (حداکثر ۸ تا که spam نشه) ──
-            for sym,pt in pattern_alerts[:8]:
-                broadcast(build_pattern_message(sym,pt));time.sleep(0.5)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s شکست‌الگو={len(pattern_alerts)}")
+            # هشدار شکست الگوی خودکار حذف شد — فقط داده جمع‌آوری می‌شود
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] سشن={sess} اسکن={int(time.time()-t0)}s (جمع‌آوری داده)")
         except Exception as e:
             print(f"[!] scan: {e}")
         time.sleep(SCAN_INTERVAL)
